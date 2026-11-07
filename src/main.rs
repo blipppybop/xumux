@@ -3,18 +3,23 @@
 //! `xumux serve` runs the daemon on a Unix socket (mode 0600).
 //! Every other subcommand is a client that sends one line and prints the reply.
 //!
-//! Wire protocol: one request line in, `OK\n<body>` or `ERR <msg>\n` out, then close.
+//! Wire protocol: one request line in, `OK\n<body>` or `ERR <msg>\n` out, then
+//! close. `attach` is the exception: after `OK\n` the connection becomes a raw
+//! bidirectional stream (program output out, keystrokes in).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::io::{self, Read, Write};
+use std::net::Shutdown;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{RecvTimeoutError, SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use std::{env, thread};
 
 #[cfg(not(all(
@@ -30,36 +35,119 @@ use std::{env, thread};
 compile_error!("xumux supports Linux on x86, x86_64, arm, aarch64 and riscv64 (ioctl numbers are arch-specific)");
 
 const USAGE: &str = "\
-usage:
-  xumux serve                      run the daemon (foreground)
-  xumux spawn NAME COMMAND...      start COMMAND (via sh -c) in a new PTY
-  xumux send NAME TEXT             write TEXT; escapes: \\r \\n \\t \\e \\\\ \\xHH
-  xumux screen NAME                print the current screen
-  xumux list                       list sessions: name, pid, status, command
-  xumux stats NAME                 CPU % and RSS of the session's process tree
-  xumux resize NAME ROWS COLS      resize the PTY (1-1000 each)
-  xumux kill NAME                  kill the session and forget it
+usage: xumux COMMAND [ARGS]
 
-socket: $XUMUX_SOCK, else $XDG_RUNTIME_DIR/xumux.sock
-tip: most TUIs submit on carriage return:  xumux send grok 'hello\\r'
+daemon
+  serve                       run the daemon (foreground)
+  shutdown                    kill every session and stop the daemon
+
+sessions
+  spawn NAME COMMAND...       start COMMAND (via sh -c) in a new 40x120 PTY
+  list                        name, pid, status, command (tab-separated)
+  info NAME                   pid, status, size, cursor, title, history, ...
+  rename NAME NEW             rename a session
+  kill NAME                   kill the session's whole process tree
+
+input
+  send NAME TEXT              write TEXT; escapes: \\r \\n \\t \\e \\\\ \\xHH
+  keys NAME KEY...            tmux-style keys: Enter Tab Esc BSpace Up Down
+                              Left Right Home End PgUp PgDn F1-F12 C-x M-x;
+                              anything else is typed as text
+
+output
+  screen NAME                 the visible screen as text
+  history NAME [LINES]        scrollback + screen (last LINES lines)
+  wait NAME MS TEXT           block until TEXT is on screen (or MS elapse)
+  log NAME PATH|off           append raw output to PATH (mode 0600)
+  stats NAME                  CPU % and RSS of the session's process tree
+
+terminal
+  attach NAME                 interactive: type into the session; Ctrl-] detaches
+  resize NAME ROWS COLS       resize the PTY (1-1000 each)
+
+socket: $XUMUX_SOCK, else $XDG_RUNTIME_DIR/xumux.sock, else /tmp/xumux-$UID/xumux.sock
+names:  1-64 chars of A-Z a-z 0-9 . _ -
+cwd/env per session: xumux spawn api 'cd ~/api && PORT=8080 exec ./server'
 ";
 
 const ROWS: u16 = 40;
 const COLS: u16 = 120;
 const MAX_DIM: u16 = 1000;
 const MAX_REQUEST: u64 = 1 << 20;
+const MAX_NAME: usize = 64;
+const MAX_WAIT_MS: u64 = 600_000;
+const INPUT_QUEUE: usize = 1024; // queued writes per session
+const MAX_PENDING: usize = 4 << 20; // queued input bytes per session before `send` reports "full"
+const IO_TIMEOUT: Duration = Duration::from_secs(5); // per client connection
+const WATCH_TIMEOUT: Duration = Duration::from_secs(5); // a stuck attached client is cut off
+const WATCH_QUEUE: usize = 1024; // output chunks an attached client may lag behind
 const USER_HZ: f64 = 100.0; // /proc reports CPU time in USER_HZ, fixed at 100 on Linux
+const DETACH_KEY: u8 = 0x1d; // Ctrl-]
+/// Internal: the daemon starts programs as `/proc/self/exe __pty-exec CMD`.
+const PTY_EXEC: &str = "__pty-exec";
 
 struct Session {
     pid: u32,
     cmd: String,
     child: Mutex<Child>,
-    writer: Arc<Mutex<File>>,
+    /// Program input. A dedicated writer thread drains it, so neither the
+    /// output reader nor a client ever blocks on a program that isn't reading.
+    input: Input,
     master: File,
+    /// Set once the reader has consumed the program's last byte of output.
+    closed: Arc<AtomicBool>,
+    /// Lock order: `out` before `term`.
+    out: Arc<Mutex<Outputs>>,
     term: Arc<Mutex<Term>>,
 }
 
+/// Bounded program input: at most INPUT_QUEUE chunks and MAX_PENDING bytes.
+#[derive(Clone)]
+struct Input {
+    tx: SyncSender<Vec<u8>>,
+    pending: Arc<AtomicUsize>,
+}
+
+impl Input {
+    fn push(&self, bytes: Vec<u8>) -> Result<(), String> {
+        let len = bytes.len();
+        if self.pending.fetch_add(len, Ordering::AcqRel) + len > MAX_PENDING {
+            self.pending.fetch_sub(len, Ordering::AcqRel);
+            return Err("input queue full: the program is not reading its input".into());
+        }
+        self.tx.try_send(bytes).map_err(|e| {
+            self.pending.fetch_sub(len, Ordering::AcqRel);
+            match e {
+                TrySendError::Full(_) => "input queue full: the program is not reading its input".into(),
+                TrySendError::Disconnected(_) => "session input is closed".into(),
+            }
+        })
+    }
+
+    /// For attached keyboards: wait for room instead of failing.
+    fn push_wait(&self, bytes: Vec<u8>) -> Result<(), ()> {
+        loop {
+            match self.push(bytes.clone()) {
+                Ok(()) => return Ok(()),
+                Err(e) if e.contains("closed") => return Err(()),
+                Err(_) => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct Outputs {
+    log: Option<(PathBuf, File)>,
+    /// Attached clients. Each has its own sender thread and bounded queue, so
+    /// a slow client is dropped instead of slowing the session down.
+    watchers: Vec<(u64, SyncSender<Arc<[u8]>>)>,
+}
+
 type Sessions = Arc<Mutex<HashMap<String, Arc<Session>>>>;
+
+static SOCKET: OnceLock<PathBuf> = OnceLock::new();
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -69,16 +157,45 @@ fn main() {
             std::process::exit(2)
         }
         Some("serve") => serve(),
+        Some(PTY_EXEC) => pty_exec(&args),
+        Some("attach") => attach(&args),
         _ => client(&args),
     }
 }
 
+/// `$XUMUX_SOCK` is used as given (the caller owns that choice). The default
+/// locations must be a real directory owned by us and closed to everyone else,
+/// so nobody can pre-create or swap the socket.
 fn sock_path() -> PathBuf {
     if let Ok(p) = env::var("XUMUX_SOCK") {
         return p.into();
     }
-    let dir = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(dir).join("xumux.sock")
+    let dir = match env::var("XDG_RUNTIME_DIR") {
+        Ok(d) if !d.is_empty() => PathBuf::from(d),
+        _ => {
+            let d = PathBuf::from(format!("/tmp/xumux-{}", sys::uid()));
+            let _ = fs::DirBuilder::new().mode(0o700).create(&d);
+            d
+        }
+    };
+    if let Err(e) = check_private_dir(&dir) {
+        die(format!("refusing socket dir {}: {e}", dir.display()));
+    }
+    dir.join("xumux.sock")
+}
+
+fn check_private_dir(dir: &Path) -> Result<(), String> {
+    let m = fs::symlink_metadata(dir).map_err(err)?;
+    if !m.is_dir() {
+        return Err("not a directory (symlinks are not followed)".into());
+    }
+    if m.uid() != sys::uid() {
+        return Err(format!("owned by uid {}, not you", m.uid()));
+    }
+    if m.mode() & 0o077 != 0 {
+        return Err(format!("mode {:o} is open to group/others, want 700", m.mode() & 0o777));
+    }
+    Ok(())
 }
 
 fn die(msg: impl std::fmt::Display) -> ! {
@@ -86,12 +203,22 @@ fn die(msg: impl std::fmt::Display) -> ! {
     std::process::exit(1)
 }
 
+fn connect() -> UnixStream {
+    let path = sock_path();
+    UnixStream::connect(&path)
+        .unwrap_or_else(|e| die(format!("{}: {e} (is `xumux serve` running?)", path.display())))
+}
+
 // ---------------------------------------------------------------- client
 
 fn client(args: &[String]) {
-    let path = sock_path();
-    let mut stream = UnixStream::connect(&path)
-        .unwrap_or_else(|e| die(format!("{}: {e} (is `xumux serve` running?)", path.display())));
+    let mut args = args.to_vec();
+    // The daemon's cwd is not ours: make log paths absolute here.
+    if args[0] == "log" && args.len() == 3 && args[2] != "off" {
+        let cwd = env::current_dir().unwrap_or_else(|e| die(e));
+        args[2] = cwd.join(&args[2]).to_string_lossy().into_owned();
+    }
+    let mut stream = connect();
     // Literal newlines would end the request line early; send them as escapes.
     let line = args.join(" ").replace('\r', "\\r").replace('\n', "\\n");
     stream
@@ -103,6 +230,54 @@ fn client(args: &[String]) {
         Some(body) => print!("{body}"),
         None => die(reply.strip_prefix("ERR ").unwrap_or(&reply).trim_end()),
     }
+}
+
+fn attach(args: &[String]) {
+    let [_, name] = args else { die("usage: attach NAME") };
+    let mut stream = connect();
+    let (rows, cols) = sys::term_size(&io::stdout()).unwrap_or((0, 0));
+    stream
+        .write_all(format!("attach {name} {rows} {cols}\n").as_bytes())
+        .unwrap_or_else(|e| die(e));
+    let mut status = Vec::new();
+    let mut byte = [0u8];
+    while stream.read(&mut byte).unwrap_or(0) == 1 && byte[0] != b'\n' {
+        status.push(byte[0]);
+    }
+    let status = String::from_utf8_lossy(&status);
+    if status != "OK" {
+        die(status.strip_prefix("ERR ").unwrap_or(&status));
+    }
+    eprint!("[xumux: attached to {name}; Ctrl-] detaches]\r\n");
+    let raw = sys::RawMode::enter(&io::stdin()); // restored on drop
+    let mut to_server = stream.try_clone().unwrap_or_else(|e| die(e));
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        let mut stdin = io::stdin().lock();
+        while let Ok(n @ 1..) = stdin.read(&mut buf) {
+            let chunk = &buf[..n];
+            if let Some(i) = chunk.iter().position(|&b| b == DETACH_KEY) {
+                // The daemon sees the detach key and lets go; we stop reading.
+                let _ = to_server.write_all(&chunk[..=i]);
+                let _ = to_server.shutdown(Shutdown::Both);
+                return;
+            }
+            if to_server.write_all(chunk).is_err() {
+                return;
+            }
+        }
+        // stdin ended (e.g. piped input): keep showing output until the session ends.
+        let _ = to_server.shutdown(Shutdown::Write);
+    });
+    let mut stdout = io::stdout().lock();
+    let mut buf = [0u8; 16384];
+    while let Ok(n @ 1..) = stream.read(&mut buf) {
+        if stdout.write_all(&buf[..n]).and_then(|_| stdout.flush()).is_err() {
+            break;
+        }
+    }
+    drop(raw);
+    let _ = stdout.write_all(b"\x1b[0m\r\n[xumux: detached]\r\n");
 }
 
 // ---------------------------------------------------------------- server
@@ -122,6 +297,7 @@ fn serve() {
     };
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap_or_else(|e| die(e));
     eprintln!("xumux listening on {}", path.display());
+    let _ = SOCKET.set(path);
 
     let sessions: Sessions = Default::default();
     for conn in listener.incoming() {
@@ -132,15 +308,101 @@ fn serve() {
 }
 
 fn handle(stream: UnixStream, sessions: &Sessions) {
-    let mut line = String::new();
-    if BufReader::new((&stream).take(MAX_REQUEST)).read_line(&mut line).is_err() {
-        return;
-    }
-    let reply = match dispatch(line.trim_end_matches(['\r', '\n']), sessions) {
+    // A client that connects and goes quiet must not pin a thread forever.
+    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+    // Defense in depth on top of the 0600 socket: only our own uid may talk to us.
+    let request = match sys::peer_uid(&stream) {
+        Ok(uid) if uid == sys::uid() => read_request(&stream),
+        Ok(uid) => Err(format!("permission denied for uid {uid}")),
+        Err(e) => Err(err(e)),
+    };
+    let (cmd, rest) = match &request {
+        Ok((line, _)) => split1(line),
+        Err(_) => ("", ""),
+    };
+    let result = match &request {
+        Err(e) => Err(e.clone()),
+        Ok((_, extra)) if cmd == "attach" => match serve_attach(&stream, rest, extra, sessions) {
+            Ok(()) => return,
+            Err(e) => Err(e),
+        },
+        Ok((line, _)) => dispatch(line, sessions),
+    };
+    let reply = match result {
         Ok(body) => format!("OK\n{body}"),
         Err(e) => format!("ERR {e}\n"),
     };
     let _ = (&stream).write_all(reply.as_bytes());
+    if request.is_err() {
+        // Closing with unread input makes Linux reset the connection, which
+        // would destroy the ERR reply before the client reads it. Drain briefly.
+        let _ = stream.shutdown(Shutdown::Write);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+        let _ = io::copy(&mut (&stream).take(16 << 20), &mut io::sink());
+    }
+    if cmd == "shutdown" && reply.starts_with("OK") {
+        if let Some(p) = SOCKET.get() {
+            let _ = fs::remove_file(p);
+        }
+        std::process::exit(0);
+    }
+}
+
+/// Read one request line. Returns it plus any bytes that arrived after the
+/// newline (keystrokes typed right after `attach`). One deadline covers the
+/// whole request, so dribbling a byte at a time cannot hold a thread.
+fn read_request(stream: &UnixStream) -> Result<(String, Vec<u8>), String> {
+    let deadline = Instant::now() + IO_TIMEOUT;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let end = loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err("timed out".into());
+        }
+        stream.set_read_timeout(Some(left)).map_err(err)?;
+        let n = match (&*stream).read(&mut chunk) {
+            Ok(0) => return Err("incomplete request (no newline)".into()),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                return Err("timed out".into());
+            }
+            Err(e) => return Err(err(e)),
+        };
+        let start = buf.len();
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(i) = buf[start..].iter().position(|&b| b == b'\n') {
+            break start + i;
+        }
+        if buf.len() as u64 > MAX_REQUEST {
+            return Err(format!("request exceeds {MAX_REQUEST} bytes"));
+        }
+    };
+    if end as u64 > MAX_REQUEST {
+        return Err(format!("request exceeds {MAX_REQUEST} bytes"));
+    }
+    let extra = buf.split_off(end + 1);
+    buf.truncate(end);
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    let line = String::from_utf8(buf).map_err(|_| "request is not valid UTF-8".to_string())?;
+    Ok((line, extra))
+}
+
+fn valid_name(name: &str) -> Result<(), String> {
+    let ok = (1..=MAX_NAME).contains(&name.len())
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid name '{}': use 1-{MAX_NAME} chars of A-Z a-z 0-9 . _ -",
+            name.escape_debug()
+        ))
+    }
 }
 
 fn err<E: std::fmt::Display>(e: E) -> String {
@@ -169,6 +431,50 @@ fn dim(s: &str) -> Result<u16, String> {
     }
 }
 
+fn status(s: &Session) -> String {
+    match s.child.lock().unwrap().try_wait() {
+        Ok(None) => "running".into(),
+        Ok(Some(st)) => match (st.code(), st.signal()) {
+            (Some(c), _) => format!("exited({c})"),
+            (_, Some(sig)) => format!("killed(sig {sig})"),
+            _ => "exited".into(),
+        },
+        Err(_) => "unknown".into(),
+    }
+}
+
+fn queue_input(s: &Session, bytes: Vec<u8>) -> Result<String, String> {
+    s.input.push(bytes).map(|()| String::new())
+}
+
+fn resize_session(s: &Session, rows: u16, cols: u16) -> Result<(), String> {
+    sys::set_size(&s.master, rows, cols).map_err(err)?;
+    s.term.lock().unwrap().resize(rows.into(), cols.into());
+    Ok(())
+}
+
+/// Take down everything the program started, not just the program: its
+/// descendants, plus anything still in its session (orphaned background jobs
+/// get reparented but keep the session id).
+fn kill_session(s: &Session) {
+    let mut child = s.child.lock().unwrap();
+    let alive = matches!(child.try_wait(), Ok(None));
+    let all = procs();
+    let mut doomed: Vec<u32> = all.iter().filter(|p| p.sid == s.pid).map(|p| p.pid).collect();
+    if alive {
+        doomed.extend(tree_of(&all, s.pid).into_keys());
+    }
+    for pid in doomed {
+        if pid != s.pid {
+            sys::kill_pid(pid);
+        }
+    }
+    if alive {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 fn dispatch(line: &str, sessions: &Sessions) -> Result<String, String> {
     let (cmd, rest) = split1(line);
     match cmd {
@@ -177,20 +483,57 @@ fn dispatch(line: &str, sessions: &Sessions) -> Result<String, String> {
             if name.is_empty() || command.trim().is_empty() {
                 return Err("usage: spawn NAME COMMAND...".into());
             }
+            valid_name(name)?;
             spawn(name, command, sessions)
         }
         "send" => {
             let (name, text) = split1(rest);
             let s = get(sessions, name)?;
-            let bytes = unescape(text)?;
-            let mut w = s.writer.lock().unwrap();
-            w.write_all(&bytes).and_then(|_| w.flush()).map_err(err)?;
-            Ok(String::new())
+            queue_input(&s, unescape(text)?)
+        }
+        "keys" => {
+            let (name, keys) = split1(rest);
+            let s = get(sessions, name)?;
+            queue_input(&s, parse_keys(keys))
         }
         "screen" => {
             let s = get(sessions, rest.trim())?;
             let contents = s.term.lock().unwrap().contents();
             Ok(format!("{contents}\n"))
+        }
+        "history" => {
+            let mut it = rest.split_whitespace();
+            let s = get(sessions, it.next().unwrap_or(""))?;
+            let lines = match it.next() {
+                Some(n) => Some(n.parse::<usize>().map_err(|_| format!("bad line count '{n}'"))?),
+                None => None,
+            };
+            let text = s.term.lock().unwrap().history_text(lines);
+            Ok(format!("{text}\n"))
+        }
+        "wait" => {
+            let (name, rest) = split1(rest);
+            let (ms, text) = split1(rest);
+            let ms: u64 = ms.parse().map_err(|_| "usage: wait NAME MS TEXT")?;
+            if text.is_empty() {
+                return Err("usage: wait NAME MS TEXT".into());
+            }
+            let s = get(sessions, name)?;
+            let deadline = Instant::now() + Duration::from_millis(ms.min(MAX_WAIT_MS));
+            loop {
+                if s.term.lock().unwrap().contents().contains(text) {
+                    return Ok(String::new());
+                }
+                // `closed`, not the exit status: output can still be in flight
+                // when the process exits.
+                if s.closed.load(Ordering::Acquire) {
+                    return Err(format!("session exited before '{text}' appeared"));
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!("timed out after {ms} ms waiting for '{text}'"));
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
         }
         "list" => {
             let map = sessions.lock().unwrap();
@@ -199,18 +542,54 @@ fn dispatch(line: &str, sessions: &Sessions) -> Result<String, String> {
             let mut out = String::new();
             for n in names {
                 let s = &map[n];
-                let status = match s.child.lock().unwrap().try_wait() {
-                    Ok(None) => "running".into(),
-                    Ok(Some(st)) => match (st.code(), st.signal()) {
-                        (Some(c), _) => format!("exited({c})"),
-                        (_, Some(sig)) => format!("killed(sig {sig})"),
-                        _ => "exited".into(),
-                    },
-                    Err(_) => "unknown".into(),
-                };
-                out += &format!("{n}\t{}\t{status}\t{}\n", s.pid, s.cmd);
+                out += &format!("{n}\t{}\t{}\t{}\n", s.pid, status(s), s.cmd);
             }
             Ok(out)
+        }
+        "info" => {
+            let s = get(sessions, rest.trim())?;
+            let o = s.out.lock().unwrap();
+            let t = s.term.lock().unwrap();
+            let log = o.log.as_ref().map_or("-".into(), |(p, _)| p.display().to_string());
+            Ok(format!(
+                "pid\t{}\nstatus\t{}\nsize\t{}x{}\ncursor\t{},{}\nalt_screen\t{}\ntitle\t{}\nhistory\t{}\nattached\t{}\nlog\t{log}\ncommand\t{}\n",
+                s.pid,
+                status(&s),
+                t.rows,
+                t.cols,
+                t.row + 1,
+                t.col + 1,
+                if t.main.is_some() { "yes" } else { "no" },
+                t.title,
+                t.history.len(),
+                o.watchers.len(),
+                s.cmd,
+            ))
+        }
+        "log" => {
+            let (name, path) = split1(rest);
+            let s = get(sessions, name)?;
+            if path == "off" {
+                s.out.lock().unwrap().log = None;
+                return Ok(String::new());
+            }
+            let path = PathBuf::from(path);
+            if !path.is_absolute() {
+                return Err("log path must be absolute".into());
+            }
+            // O_NONBLOCK: opening a FIFO nobody reads must fail, not hang.
+            let f = OpenOptions::new()
+                .append(true)
+                .create(true)
+                .mode(0o600)
+                .custom_flags(sys::O_NONBLOCK)
+                .open(&path)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            if !f.metadata().map_err(err)?.is_file() {
+                return Err(format!("{}: not a regular file", path.display()));
+            }
+            s.out.lock().unwrap().log = Some((path, f));
+            Ok(String::new())
         }
         "stats" => stats(get(sessions, rest.trim())?.pid),
         "resize" => {
@@ -220,8 +599,21 @@ fn dispatch(line: &str, sessions: &Sessions) -> Result<String, String> {
             };
             let (rows, cols) = (dim(r)?, dim(c)?);
             let s = get(sessions, name)?;
-            sys::set_size(&s.master, rows, cols).map_err(err)?;
-            s.term.lock().unwrap().resize(rows.into(), cols.into());
+            resize_session(&s, rows, cols)?;
+            Ok(String::new())
+        }
+        "rename" => {
+            let mut it = rest.split_whitespace();
+            let (Some(old), Some(new)) = (it.next(), it.next()) else {
+                return Err("usage: rename NAME NEW".into());
+            };
+            valid_name(new)?;
+            let mut map = sessions.lock().unwrap();
+            if map.contains_key(new) {
+                return Err(format!("session '{new}' already exists"));
+            }
+            let s = map.remove(old).ok_or_else(|| format!("no session '{old}'"))?;
+            map.insert(new.to_string(), s);
             Ok(String::new())
         }
         "kill" => {
@@ -231,16 +623,83 @@ fn dispatch(line: &str, sessions: &Sessions) -> Result<String, String> {
                 .unwrap()
                 .remove(name)
                 .ok_or_else(|| format!("no session '{name}'"))?;
-            let mut child = s.child.lock().unwrap();
-            if let Ok(None) = child.try_wait() {
-                child.kill().map_err(err)?;
-                let _ = child.wait();
-            }
+            kill_session(&s);
             Ok(String::new())
         }
+        "shutdown" => {
+            let all: Vec<_> = sessions.lock().unwrap().drain().map(|(_, s)| s).collect();
+            for s in &all {
+                kill_session(s);
+            }
+            Ok(format!("killed {} sessions\n", all.len()))
+        }
         "" => Err("empty request".into()),
-        other => Err(format!("unknown command '{other}'")),
+        other => Err(format!("unknown command '{other}' (try `xumux help`)")),
     }
+}
+
+fn serve_attach(stream: &UnixStream, rest: &str, typed: &[u8], sessions: &Sessions) -> Result<(), String> {
+    let mut it = rest.split_whitespace();
+    let s = get(sessions, it.next().unwrap_or(""))?;
+    // The client sends its own size; "0 0" means unknown (not a terminal).
+    if let (Some(Ok(r)), Some(Ok(c))) = (it.next().map(dim), it.next().map(dim)) {
+        resize_session(&s, r, c)?;
+    }
+    let mut out = stream.try_clone().map_err(err)?;
+    out.set_write_timeout(Some(WATCH_TIMEOUT)).map_err(err)?;
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let (tx, rx) = sync_channel::<Arc<[u8]>>(WATCH_QUEUE);
+    thread::spawn(move || {
+        for chunk in rx {
+            if out.write_all(&chunk).is_err() {
+                break;
+            }
+        }
+        let _ = out.shutdown(Shutdown::Both); // dropped, detached or session over
+    });
+    {
+        // Holding `out` keeps the reader from sending output between the
+        // snapshot and registration, so the client sees every byte exactly once.
+        let mut o = s.out.lock().unwrap();
+        let mut first = b"OK\n".to_vec();
+        first.extend_from_slice(s.term.lock().unwrap().redraw().as_bytes());
+        tx.try_send(first.into()).map_err(err)?;
+        o.watchers.push((id, tx));
+    }
+    let _ = stream.set_read_timeout(None);
+    // Ctrl-] (DETACH_KEY) detaches. Plain end of input only means the client
+    // has nothing more to type: it keeps receiving output until the session
+    // ends or a write to it fails.
+    let mut buf = [0u8; 4096];
+    let mut pending = typed.to_vec();
+    loop {
+        let detach = pending.iter().position(|&b| b == DETACH_KEY);
+        let keys = &pending[..detach.unwrap_or(pending.len())];
+        if !keys.is_empty() && s.input.push_wait(keys.to_vec()).is_err() {
+            break;
+        }
+        if detach.is_some() {
+            s.out.lock().unwrap().watchers.retain(|(w, _)| *w != id);
+            let _ = stream.shutdown(Shutdown::Both);
+            break;
+        }
+        match (&*stream).read(&mut buf) {
+            Ok(n @ 1..) => pending = buf[..n].to_vec(),
+            _ => break,
+        }
+    }
+    Ok(())
+}
+
+/// Runs in the new child, whose stdio is already the PTY: start a session,
+/// take the PTY as controlling terminal, become `sh -c 'exec COMMAND'`.
+fn pty_exec(args: &[String]) -> ! {
+    let [_, command] = args else { die("internal command") };
+    if let Err(e) = sys::make_controlling_tty() {
+        die(format!("cannot take the terminal: {e}"));
+    }
+    let e = Command::new("/bin/sh").arg("-c").arg(format!("exec {command}")).exec();
+    die(format!("/bin/sh: {e}"))
 }
 
 fn open_pty_dev(path: &str) -> io::Result<File> {
@@ -261,9 +720,12 @@ fn spawn(name: &str, command: &str, sessions: &Sessions) -> Result<String, Strin
     sys::set_size(&master, ROWS, COLS).map_err(err)?;
     let slave = open_pty_dev(&format!("/dev/pts/{n}")).map_err(err)?;
 
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c")
-        .arg(format!("exec {command}"))
+    // No pre_exec hook, so std can use posix_spawn (CLONE_VM) instead of
+    // fork(): fork has to copy the daemon's memory map, which grows with every
+    // session. The helper takes the terminal, then execs the shell.
+    let mut cmd = Command::new("/proc/self/exe");
+    cmd.arg(PTY_EXEC)
+        .arg(command)
         .env("TERM", "xterm-256color")
         .stdin(Stdio::from(slave.try_clone().map_err(err)?))
         .stdout(Stdio::from(slave.try_clone().map_err(err)?))
@@ -271,34 +733,88 @@ fn spawn(name: &str, command: &str, sessions: &Sessions) -> Result<String, Strin
     if let Ok(home) = env::var("HOME") {
         cmd.current_dir(home);
     }
-    // SAFETY: the hook only makes two async-signal-safe syscalls (setsid, ioctl)
-    // and does not allocate.
-    unsafe { cmd.pre_exec(sys::make_controlling_tty) };
     let mut child = cmd.spawn().map_err(err)?;
     drop(cmd); // close our copies of the slave so reads hit EOF/EIO when the child exits
 
-    let mut reader = master.try_clone().map_err(err)?;
-    let writer = Arc::new(Mutex::new(master.try_clone().map_err(err)?));
-    let term = Arc::new(Mutex::new(Term::new(ROWS.into(), COLS.into())));
-    let (feed, answer) = (term.clone(), writer.clone());
+    // The master is non-blocking and both threads wait in poll(). A blocking
+    // write to a PTY whose program is gone is never woken by Linux, so the
+    // writer must be able to notice `closed` and give up.
+    sys::set_nonblocking(&master).map_err(err)?;
+    let closed = Arc::new(AtomicBool::new(false));
+
+    // Writer thread: the only place that waits on the program's input.
+    let (tx, queue) = sync_channel::<Vec<u8>>(INPUT_QUEUE);
+    let input = Input { tx, pending: Default::default() };
+    let mut writer = master.try_clone().map_err(err)?;
+    let (gone, pending) = (closed.clone(), input.pending.clone());
     thread::spawn(move || {
-        let mut buf = [0u8; 8192];
+        'chunks: loop {
+            let chunk = match queue.recv_timeout(Duration::from_millis(100)) {
+                Ok(chunk) => chunk,
+                Err(RecvTimeoutError::Timeout) if gone.load(Ordering::Acquire) => break,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
+            pending.fetch_sub(chunk.len(), Ordering::AcqRel);
+            let mut rest = &chunk[..];
+            while !rest.is_empty() {
+                match writer.write(rest) {
+                    Ok(n) => rest = &rest[n..],
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        if gone.load(Ordering::Acquire) {
+                            break 'chunks;
+                        }
+                        sys::wait_ready(&writer, sys::POLLOUT, 100);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => break 'chunks,
+                }
+            }
+        }
+    });
+
+    // Reader thread: output -> emulator, log file, attached clients.
+    let mut reader = master.try_clone().map_err(err)?;
+    let term = Arc::new(Mutex::new(Term::new(ROWS.into(), COLS.into())));
+    let out: Arc<Mutex<Outputs>> = Default::default();
+    let (feed, fanout, answer, done) = (term.clone(), out.clone(), input.clone(), closed.clone());
+    thread::spawn(move || {
+        let mut buf = [0u8; 16384];
         loop {
             let n = match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    sys::wait_ready(&reader, sys::POLLIN, -1);
+                    continue;
+                }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => break, // EIO once the child side is closed
             };
+            let chunk = &buf[..n];
+            let mut o = fanout.lock().unwrap();
             let reply = {
                 let mut t = feed.lock().unwrap();
-                t.feed(&buf[..n]);
+                t.feed(chunk);
                 std::mem::take(&mut t.reply)
             };
             if !reply.is_empty() {
-                let _ = answer.lock().unwrap().write_all(&reply);
+                let _ = answer.push(reply); // dropped if the program isn't reading
+            }
+            if let Some((_, f)) = &mut o.log
+                && f.write_all(chunk).is_err()
+            {
+                o.log = None;
+            }
+            if !o.watchers.is_empty() {
+                let shared: Arc<[u8]> = chunk.into();
+                // a client too far behind is dropped; it can re-attach for a fresh redraw
+                o.watchers.retain(|(_, w)| w.try_send(shared.clone()).is_ok());
             }
         }
+        done.store(true, Ordering::Release);
+        drop(answer);
+        fanout.lock().unwrap().watchers.clear(); // senders flush, then close: clients see EOF
     });
 
     let pid = child.id();
@@ -314,12 +830,92 @@ fn spawn(name: &str, command: &str, sessions: &Sessions) -> Result<String, Strin
             pid,
             cmd: command.to_string(),
             child: Mutex::new(child),
-            writer,
+            input,
             master,
+            closed,
+            out,
             term,
         }),
     );
     Ok(format!("{pid}\n"))
+}
+
+/// tmux `send-keys` style: each word is a key name if it is one, otherwise
+/// literal text. Consecutive literal words keep a single space between them.
+fn parse_keys(keys: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut last_literal = false;
+    for word in keys.split(' ').filter(|w| !w.is_empty()) {
+        match key(word) {
+            Some(bytes) => {
+                out.extend_from_slice(&bytes);
+                last_literal = false;
+            }
+            None => {
+                if last_literal {
+                    out.push(b' ');
+                }
+                out.extend_from_slice(word.as_bytes());
+                last_literal = true;
+            }
+        }
+    }
+    out
+}
+
+fn key(name: &str) -> Option<Vec<u8>> {
+    let seq: &[u8] = match name {
+        "Enter" => b"\r",
+        "Tab" => b"\t",
+        "BTab" => b"\x1b[Z",
+        "Space" => b" ",
+        "Esc" | "Escape" => b"\x1b",
+        "BSpace" => b"\x7f",
+        "Up" => b"\x1b[A",
+        "Down" => b"\x1b[B",
+        "Right" => b"\x1b[C",
+        "Left" => b"\x1b[D",
+        "Home" => b"\x1b[H",
+        "End" => b"\x1b[F",
+        "PgUp" | "PageUp" => b"\x1b[5~",
+        "PgDn" | "PageDown" => b"\x1b[6~",
+        "IC" | "Insert" => b"\x1b[2~",
+        "DC" | "Delete" => b"\x1b[3~",
+        "F1" => b"\x1bOP",
+        "F2" => b"\x1bOQ",
+        "F3" => b"\x1bOR",
+        "F4" => b"\x1bOS",
+        "F5" => b"\x1b[15~",
+        "F6" => b"\x1b[17~",
+        "F7" => b"\x1b[18~",
+        "F8" => b"\x1b[19~",
+        "F9" => b"\x1b[20~",
+        "F10" => b"\x1b[21~",
+        "F11" => b"\x1b[23~",
+        "F12" => b"\x1b[24~",
+        _ => {
+            if let Some(rest) = name.strip_prefix("M-").filter(|r| !r.is_empty()) {
+                let mut v = vec![0x1b];
+                v.extend(key(rest).unwrap_or_else(|| rest.as_bytes().to_vec()));
+                return Some(v);
+            }
+            let c = name.strip_prefix("C-")?;
+            let [b] = c.as_bytes() else { return None };
+            return Some(vec![match b {
+                b'a'..=b'z' => b - b'a' + 1,
+                b'A'..=b'Z' => b - b'A' + 1,
+                b'@' | b' ' | b'2' => 0,
+                b'[' | b'3' => 0x1b,
+                b'\\' | b'4' => 0x1c,
+                b']' | b'5' => 0x1d,
+                b'^' | b'6' => 0x1e,
+                b'_' | b'7' => 0x1f,
+                b'?' | b'8' => 0x7f,
+                _ => return None,
+            }]);
+        }
+    };
+    Some(seq.to_vec())
 }
 
 fn unescape(s: &str) -> Result<Vec<u8>, String> {
@@ -353,22 +949,141 @@ fn unescape(s: &str) -> Result<Vec<u8>, String> {
 
 // ---------------------------------------------------------------- kernel interface
 //
-// All raw syscalls live here (the pre_exec registration in spawn() is the only
-// other `unsafe`). Two libc symbols (already linked by std) and four
-// ioctl numbers from <asm-generic/ioctls.h>.
+// The only `unsafe` in xumux. Ten libc symbols, already linked by std, and constants from
+// <asm-generic/ioctls.h> and <asm-generic/socket.h>.
 
 mod sys {
-    use std::ffi::{c_int, c_ulong};
+    use std::ffi::{c_int, c_ulong, c_void};
     use std::io;
     use std::os::fd::AsRawFd;
 
     unsafe extern "C" {
         fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
         fn setsid() -> c_int;
+        fn getuid() -> u32;
+        fn kill(pid: c_int, sig: c_int) -> c_int;
+        fn getsockopt(fd: c_int, level: c_int, name: c_int, val: *mut c_void, len: *mut u32) -> c_int;
+        fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+        fn poll(fds: *mut PollFd, nfds: u64, timeout_ms: c_int) -> c_int;
+        fn tcgetattr(fd: c_int, termios: *mut c_void) -> c_int;
+        fn tcsetattr(fd: c_int, action: c_int, termios: *const c_void) -> c_int;
+        fn cfmakeraw(termios: *mut c_void);
+    }
+
+    /// `struct termios` is treated as an opaque blob (it is 60 bytes on Linux);
+    /// we only ever hand it back to libc, so its layout never matters here.
+    type Termios = [u64; 16];
+    const TCSANOW: c_int = 0;
+
+    /// Puts a terminal in raw mode; the original settings come back on drop.
+    pub struct RawMode {
+        fd: c_int,
+        saved: Termios,
+    }
+
+    impl RawMode {
+        pub fn enter(tty: &impl AsRawFd) -> Option<RawMode> {
+            let fd = tty.as_raw_fd();
+            let mut saved: Termios = [0; 16];
+            // SAFETY: the buffer is larger and more aligned than struct termios.
+            unsafe {
+                if tcgetattr(fd, saved.as_mut_ptr().cast()) != 0 {
+                    return None; // not a terminal
+                }
+                let mut raw = saved;
+                cfmakeraw(raw.as_mut_ptr().cast());
+                if tcsetattr(fd, TCSANOW, raw.as_ptr().cast()) != 0 {
+                    return None;
+                }
+            }
+            Some(RawMode { fd, saved })
+        }
+    }
+
+    impl Drop for RawMode {
+        fn drop(&mut self) {
+            // SAFETY: restores the settings tcgetattr filled in.
+            unsafe { tcsetattr(self.fd, TCSANOW, self.saved.as_ptr().cast()) };
+        }
+    }
+
+    /// (rows, cols) of a terminal.
+    pub fn term_size(tty: &impl AsRawFd) -> Option<(u16, u16)> {
+        let mut ws = Winsize { rows: 0, cols: 0, xpixel: 0, ypixel: 0 };
+        // SAFETY: valid fd; pointer to a live winsize.
+        let r = unsafe { ioctl(tty.as_raw_fd(), TIOCGWINSZ, &mut ws as *mut Winsize) };
+        (r == 0 && ws.rows > 0 && ws.cols > 0).then_some((ws.rows, ws.cols))
+    }
+
+    const F_GETFL: c_int = 3;
+    const F_SETFL: c_int = 4;
+    pub const O_NONBLOCK: c_int = 0o4000;
+    pub const POLLIN: i16 = 0x1;
+    pub const POLLOUT: i16 = 0x4;
+
+    #[repr(C)]
+    pub struct PollFd {
+        fd: c_int,
+        events: i16,
+        revents: i16,
+    }
+
+    pub fn set_nonblocking(f: &impl AsRawFd) -> io::Result<()> {
+        // SAFETY: valid fd; integer-only fcntl commands.
+        unsafe {
+            let flags = fcntl(f.as_raw_fd(), F_GETFL);
+            check(flags)?;
+            check(fcntl(f.as_raw_fd(), F_SETFL, flags | O_NONBLOCK))
+        }
+    }
+
+    /// Wait until `f` is ready for `events` (or hung up), up to `timeout_ms`
+    /// (-1 = forever). EINTR counts as a spurious wakeup.
+    pub fn wait_ready(f: &impl AsRawFd, events: i16, timeout_ms: c_int) {
+        let mut p = PollFd { fd: f.as_raw_fd(), events, revents: 0 };
+        // SAFETY: one live, correctly laid out pollfd.
+        unsafe { poll(&mut p, 1, timeout_ms) };
+    }
+
+    const SIGKILL: c_int = 9;
+    const SOL_SOCKET: c_int = 1;
+    const SO_PEERCRED: c_int = 17;
+
+    #[repr(C)]
+    struct Ucred {
+        pid: i32,
+        uid: u32,
+        gid: u32,
+    }
+
+    pub fn uid() -> u32 {
+        // SAFETY: getuid takes no arguments and cannot fail.
+        unsafe { getuid() }
+    }
+
+    /// SIGKILL one process. Refuses pid 0, 1 and anything that would wrap to a
+    /// negative pid, since kill(0|-1|-n) target whole process groups.
+    pub fn kill_pid(pid: u32) {
+        if let Ok(p @ 2..) = c_int::try_from(pid) {
+            // SAFETY: plain syscall with a positive pid.
+            unsafe { kill(p, SIGKILL) };
+        }
+    }
+
+    /// The uid of the process on the other end of a Unix socket (SO_PEERCRED).
+    pub fn peer_uid(sock: &impl AsRawFd) -> io::Result<u32> {
+        let mut cred = Ucred { pid: 0, uid: u32::MAX, gid: u32::MAX };
+        let mut len = std::mem::size_of::<Ucred>() as u32;
+        // SAFETY: valid fd; cred/len point to live locals and len holds cred's size.
+        check(unsafe {
+            getsockopt(sock.as_raw_fd(), SOL_SOCKET, SO_PEERCRED, (&mut cred as *mut Ucred).cast(), &mut len)
+        })?;
+        Ok(cred.uid)
     }
 
     pub const O_NOCTTY: i32 = 0o400;
     const TIOCSCTTY: c_ulong = 0x540E;
+    const TIOCGWINSZ: c_ulong = 0x5413;
     const TIOCSWINSZ: c_ulong = 0x5414;
     const TIOCGPTN: c_ulong = 0x8004_5430; // _IOR('T', 0x30, unsigned int)
     const TIOCSPTLCK: c_ulong = 0x4004_5431; // _IOW('T', 0x31, int)
@@ -404,9 +1119,7 @@ mod sys {
         unsafe { check(ioctl(master.as_raw_fd(), TIOCSWINSZ, &ws as *const Winsize)) }
     }
 
-    /// Runs in the forked child (pre_exec), after stdio is the PTY slave:
-    /// start a new session and adopt stdin as the controlling terminal.
-    /// Async-signal-safe: no allocation, only raw syscalls.
+    /// Start a new session and adopt stdin (a PTY slave) as the controlling terminal.
     pub fn make_controlling_tty() -> io::Result<()> {
         // SAFETY: plain syscalls with integer arguments.
         unsafe {
@@ -453,12 +1166,29 @@ struct Term {
     utf8: Vec<u8>,
     utf8_need: usize,
     reply: Vec<u8>, // bytes to send back to the program
+    history: VecDeque<String>, // lines scrolled off the top of the main screen
+    title: String,             // set by OSC 0 / OSC 2
+    osc: Vec<u8>,
 }
+
+const HISTORY_LINES: usize = 10_000;
+const MAX_OSC: usize = 1024;
 
 fn width(c: char) -> usize {
     match c as u32 {
-        0..=0x2FF => 1,
-        0x300..=0x36F | 0x200B..=0x200F | 0x20D0..=0x20FF | 0xFE00..=0xFE0F => 0,
+        // C0/C1 controls never reach the grid: U+009B is CSI on some terminals,
+        // so letting it through would let a program inject escapes into
+        // whoever prints `screen`.
+        0x00..=0x1F | 0x7F..=0x9F => 0,
+        // combining marks, zero-width chars, and bidi controls (U+202A-202E,
+        // U+2066-2069: "Trojan Source" reordering) are dropped too
+        0x300..=0x36F
+        | 0x200B..=0x200F
+        | 0x2028..=0x202E
+        | 0x2060..=0x206F
+        | 0x20D0..=0x20FF
+        | 0xFE00..=0xFE0F
+        | 0xFEFF => 0,
         0x1100..=0x115F
         | 0x2E80..=0x303E
         | 0x3041..=0x4DBF
@@ -494,14 +1224,55 @@ impl Term {
             utf8: Vec::new(),
             utf8_need: 0,
             reply: Vec::new(),
+            history: VecDeque::new(),
+            title: String::new(),
+            osc: Vec::new(),
+        }
+    }
+
+    fn line(&self, r: usize) -> String {
+        let s: String = self.grid[r * self.cols..(r + 1) * self.cols]
+            .iter()
+            .filter(|&&c| c != WIDE_TAIL)
+            .collect();
+        s.trim_end_matches(' ').to_string()
+    }
+
+    /// Scrollback followed by the screen; the last `lines` lines if given.
+    fn history_text(&self, lines: Option<usize>) -> String {
+        let screen = self.contents();
+        let all: Vec<&str> = self
+            .history
+            .iter()
+            .map(String::as_str)
+            .chain(screen.lines())
+            .collect();
+        let skip = lines.map_or(0, |n| all.len().saturating_sub(n));
+        all[skip..].join("\n")
+    }
+
+    /// Escape sequence that repaints this screen on an attaching terminal.
+    fn redraw(&self) -> String {
+        let mut out = String::from("\x1b[0m\x1b[H\x1b[2J");
+        for r in 0..self.rows {
+            out += &format!("\x1b[{};1H{}", r + 1, self.line(r));
+        }
+        out += &format!("\x1b[{};{}H", self.row + 1, self.col + 1);
+        out
+    }
+
+    fn osc_done(&mut self) {
+        let payload = String::from_utf8_lossy(&self.osc).into_owned();
+        self.osc.clear();
+        if let Some(t) = payload.strip_prefix("0;").or_else(|| payload.strip_prefix("2;")) {
+            self.title = t.chars().filter(|&c| width(c) > 0).take(256).collect();
         }
     }
 
     fn contents(&self) -> String {
         let mut out = String::new();
-        for line in self.grid.chunks(self.cols) {
-            let s: String = line.iter().filter(|&&c| c != WIDE_TAIL).collect();
-            out.push_str(s.trim_end_matches(' '));
+        for r in 0..self.rows {
+            out += &self.line(r);
             out.push('\n');
         }
         out.truncate(out.trim_end_matches('\n').len());
@@ -559,9 +1330,19 @@ impl Term {
                 _ => {}
             },
             Osc => match b {
-                0x07 => self.state = Ground,
-                0x1b => self.state = OscEsc,
-                _ => {}
+                0x07 => {
+                    self.osc_done();
+                    self.state = Ground;
+                }
+                0x1b => {
+                    self.osc_done();
+                    self.state = OscEsc;
+                }
+                _ => {
+                    if self.osc.len() < MAX_OSC {
+                        self.osc.push(b);
+                    }
+                }
             },
             Str => {
                 if b == 0x1b {
@@ -628,7 +1409,10 @@ impl Term {
                 self.params.clear();
                 self.state = State::Csi;
             }
-            b']' => self.state = State::Osc,
+            b']' => {
+                self.osc.clear();
+                self.state = State::Osc;
+            }
             b'P' | b'X' | b'^' | b'_' => self.state = State::Str,
             b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' | b'#' | b'%' | b' ' => {
                 self.state = State::Charset
@@ -641,7 +1425,11 @@ impl Term {
                 self.index();
             }
             b'M' => self.reverse_index(),
-            b'c' => *self = Term::new(self.rows, self.cols),
+            b'c' => {
+                let history = std::mem::take(&mut self.history);
+                *self = Term::new(self.rows, self.cols);
+                self.history = history;
+            }
             _ => {}
         }
     }
@@ -808,6 +1596,15 @@ impl Term {
 
     fn scroll_up(&mut self, t: usize, b: usize, n: usize) {
         let (n, c) = (n.min(b + 1 - t), self.cols);
+        if t == 0 && self.main.is_none() {
+            for r in 0..n {
+                let line = self.line(r);
+                self.history.push_back(line);
+            }
+            while self.history.len() > HISTORY_LINES {
+                self.history.pop_front();
+            }
+        }
         self.grid.copy_within((t + n) * c..(b + 1) * c, t * c);
         self.grid[(b + 1 - n) * c..(b + 1) * c].fill(' ');
     }
@@ -861,13 +1658,30 @@ impl Term {
 
 // ---------------------------------------------------------------- /proc stats
 
-/// (ppid, utime + stime in ticks)
-fn proc_stat(pid: u32) -> Option<(u32, u64)> {
-    let s = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // comm may contain spaces/parens, so parse after the last ')'
-    let f: Vec<&str> = s[s.rfind(')')? + 1..].split_whitespace().collect();
-    let ticks = f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?;
-    Some((f.get(1)?.parse().ok()?, ticks))
+struct Proc {
+    pid: u32,
+    ppid: u32,
+    sid: u32,
+    ticks: u64, // utime + stime
+}
+
+/// One pass over /proc.
+fn procs() -> Vec<Proc> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Ok(s) = fs::read_to_string(format!("/proc/{pid}/stat")) else { continue };
+        // comm may contain spaces/parens, so parse after the last ')'
+        let Some(close) = s.rfind(')') else { continue };
+        let f: Vec<&str> = s[close + 1..].split_whitespace().collect();
+        let num = |i: usize| f.get(i).and_then(|v| v.parse::<u64>().ok());
+        if let (Some(ppid), Some(sid), Some(u), Some(st)) = (num(1), num(3), num(11), num(12)) {
+            out.push(Proc { pid, ppid: ppid as u32, sid: sid as u32, ticks: u + st });
+        }
+    }
+    out
 }
 
 fn rss_kib(pid: u32) -> u64 {
@@ -880,18 +1694,12 @@ fn rss_kib(pid: u32) -> u64 {
         .unwrap_or(0)
 }
 
-/// root and all its descendants, with their CPU ticks
-fn tree(root: u32) -> HashMap<u32, u64> {
+/// `root` and all its descendants, with their CPU ticks.
+fn tree_of(all: &[Proc], root: u32) -> HashMap<u32, u64> {
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-    let mut ticks = HashMap::new();
-    for entry in fs::read_dir("/proc").into_iter().flatten().flatten() {
-        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
-            continue;
-        };
-        if let Some((ppid, t)) = proc_stat(pid) {
-            children.entry(ppid).or_default().push(pid);
-            ticks.insert(pid, t);
-        }
+    let ticks: HashMap<u32, u64> = all.iter().map(|p| (p.pid, p.ticks)).collect();
+    for p in all {
+        children.entry(p.ppid).or_default().push(p.pid);
     }
     let mut out = HashMap::new();
     let mut seen = HashSet::new();
@@ -906,6 +1714,10 @@ fn tree(root: u32) -> HashMap<u32, u64> {
         stack.extend(children.get(&p).into_iter().flatten());
     }
     out
+}
+
+fn tree(root: u32) -> HashMap<u32, u64> {
+    tree_of(&procs(), root)
 }
 
 fn stats(pid: u32) -> Result<String, String> {
@@ -993,6 +1805,25 @@ mod tests {
     fn osc_and_colors_are_invisible() {
         assert_eq!(term(1, 10, "\x1b]0;title\x07\x1b[1;31mred\x1b[0m").contents(), "red");
         assert_eq!(term(1, 10, "\x1b]8;;http://x\x1b\\link").contents(), "link");
+    }
+
+    #[test]
+    fn controls_and_bidi_never_reach_the_screen() {
+        // U+009B (C1 CSI), U+202E (RTL override), U+2066 (LRI), U+FEFF, raw DEL
+        let t = term(1, 20, "a\u{9b}31mb\u{202e}c\u{2066}d\u{feff}e\x7ff");
+        let out = t.contents();
+        assert_eq!(out, "a31mbcdef");
+        assert!(out.chars().all(|c| !c.is_control()));
+    }
+
+    #[test]
+    fn names_are_validated() {
+        for ok in ["a", "grok", "job-1.2_x", &"x".repeat(64)] {
+            assert!(valid_name(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "a b", "a\tb", "../x", "a/b", "é", &"x".repeat(65)] {
+            assert!(valid_name(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

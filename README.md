@@ -1,142 +1,170 @@
+<div align="center">
+
 # xumux
 
-**A lean, local terminal multiplexer built for automation.**
+### The zero-dependency terminal multiplexer for programs, scripts and AI agents
 
-**Zero dependencies.** Nothing but the Rust standard library: no crates, no C libraries beyond the libc that std already links.
+`0 dependencies` · `1 Rust file` · `565 KiB binary` · `89 tests` · `Linux` · `MIT`
 
-xumux runs programs inside pseudo-terminals and lets anything on the machine — scripts, AI agents, other terminals — drive them through a tiny Unix-socket protocol: start a program, type into it, read its screen, check its CPU and memory, kill it.
+</div>
 
-It is the part of tmux you need for programmatic control, without the rest.
+---
 
-|                     | xumux                         | tmux                              |
-|---------------------|-------------------------------|-----------------------------------|
-| Source              | ~830 lines of Rust, one file  | ~70k lines of C                   |
-| Dependencies        | **none** (std only)           | libevent, ncurses                 |
-| Binary              | ~480 KB                       | larger, plus shared libs          |
-| Config              | none                          | config language, key tables       |
-| Memory safety       | safe Rust; `unsafe` only for 4 syscalls | C                        |
-| Process stats       | built in (`stats`)            | not built in                      |
-| Interactive UI      | no, headless only             | yes: panes, status bar, copy mode |
+> ## Abstract
+>
+> **xumux runs programs inside real terminals and lets anything on your machine drive them**: start a program, type into it, read its screen, wait for output, watch its CPU and memory, attach to it interactively, and kill its whole process tree.
+>
+> **Zero dependency.** It's built from the Rust standard library and nothing else. `Cargo.lock` lists exactly one package: xumux itself. There's no third-party crate, no C library beyond the libc that std already links, no build script and no code generation. The terminal emulator, PTY handling, protocol and process monitoring are all written here, in one file you can read in an afternoon.
+>
+> **Fully local.** There's no network code at all. xumux talks over a Unix socket that only your user can open, in a directory only your user can enter, and it checks the uid of every connecting process with `SO_PEERCRED`. It never phones home, never downloads anything, and builds offline.
+>
+> **Open source.** MIT licensed. Everything that runs is in this repository: no binary blobs, no vendored code, no supply chain to trust.
 
-## Why
+---
 
-Tools like tmux are great for humans sitting at a keyboard. When the "user" is a program, such as an AI coding agent coordinating with another agent or a script babysitting a long-running TUI, most of that machinery is dead weight. xumux keeps only what automation needs:
+## At a glance
 
-- **Real PTYs.** Programs think they're in a normal terminal, so full-screen TUIs (`top`, editors, agent CLIs) work.
-- **A parsed screen.** Output goes through a built-in VT100/xterm emulator, so `screen` returns what a human would *see*, not a stream of escape codes. It handles cursor movement, erase, insert/delete, scroll regions, the alternate screen, UTF-8 and double-width characters, and it answers cursor-position and device-attribute queries so programs that ask don't hang.
-- **CPU and memory monitoring.** `stats` samples `/proc` for the session's whole process tree (the program plus every child it spawned).
-- **Small enough to audit.** One file you can read in an afternoon. No config, no plugins, no network listener, no third-party code.
+|                         | **xumux**                                     | tmux                                     |
+|-------------------------|-----------------------------------------------|------------------------------------------|
+| Source                  | **1,745 lines**, 1 file                       | 114,498 lines, 157 files                 |
+| Dependencies            | **none**                                      | libevent, ncurses (+ utf8proc, jemalloc) |
+| Binary                  | **565 KiB**, statically linked Rust           | plus shared libraries                    |
+| Clean build             | **4.8 s**, offline                            | autotools + library headers              |
+| Idle daemon memory      | **2.5 MiB**                                   |                                          |
+| Built for               | programs and agents (people via `attach`)     | people at a keyboard                     |
+| Memory safety           | Rust; `unsafe` only in 11 syscall wrappers    | C                                        |
 
-## Zero dependencies
+<sub>Total lines of source, including comments and blanks; xumux's count leaves out its tests. tmux counted at commit `a73616d` (2026-10-30).</sub>
 
-`Cargo.lock` has exactly one package: xumux. Everything a crate would normally provide is written in the open:
-
-- **PTYs** are opened through `/dev/ptmx` with std's `OpenOptions`. Processes are started, killed and reaped with std's `Command`/`Child`.
-- **Kernel calls.** `unsafe` appears only in the `sys` module and in the one line that registers `sys::make_controlling_tty` as the pre-exec hook. `sys` uses 2 libc symbols (`ioctl`, `setsid`) for 4 operations (unlock the PTY, get its number, set the window size, take a controlling terminal). Every call has a `SAFETY` comment.
-- **The terminal emulator** is about 400 lines of safe Rust with unit tests and a randomized stress test, because a panic would take the daemon down.
-
-The tradeoff is that this code is ours to maintain, not borrowed from crates with wider use. That's deliberate: there's no supply chain to compromise, and the whole program can be reviewed in one sitting.
-
-## Install
-
-Needs a Rust toolchain (1.88+, edition 2024). Works fully offline: `cargo build` downloads nothing.
+## Quick start
 
 ```sh
-git clone https://github.com/blipppybop/xumux.git
-cd xumux
-cargo build --release
-cargo test --release              # optional: emulator tests + fuzz
+git clone https://github.com/blipppybop/xumux.git && cd xumux
+cargo build --release                  # downloads nothing
 install -m 755 target/release/xumux ~/.local/bin/
+
+xumux serve &                          # the daemon
+xumux spawn api 'cd ~/api && PORT=8080 exec ./server'
+xumux wait api 10000 'listening'       # block until it's up
+xumux screen api                       # what's on its screen right now
+xumux stats api                        # CPU and memory of its process tree
+xumux attach api                       # take the keyboard; Ctrl-] detaches
 ```
 
-## Usage
+## Commands
 
-Start the daemon (foreground; run it under `systemd --user`, `nohup`, or a spare terminal):
+| xumux | Does | tmux equivalent |
+|---|---|---|
+| `serve` | run the daemon | `start-server` |
+| `spawn NAME COMMAND...` | start a program in a new 40×120 PTY | `new-session -d` |
+| `list` | name, pid, status, command | `list-sessions` |
+| `info NAME` | pid, status, size, cursor, title, alt screen, history, viewers, log | `display -p` |
+| `send NAME TEXT` | type text; escapes `\r \n \t \e \\ \xHH` | `send-keys -l` |
+| `keys NAME KEY...` | `Enter Tab Esc BSpace Up Down Left Right Home End PgUp PgDn F1`–`F12 C-x M-x`, or plain text | `send-keys` |
+| `screen NAME` | the visible screen as plain text | `capture-pane -p` |
+| `history NAME [LINES]` | scrollback + screen (keeps 10,000 lines) | `capture-pane -p -S -` |
+| `wait NAME MS TEXT` | block until `TEXT` is on screen | *none (scripts poll)* |
+| `log NAME PATH\|off` | append raw output to a file | `pipe-pane` |
+| `stats NAME` | CPU % and RSS of the whole process tree | *none* |
+| `attach NAME` | interactive; `Ctrl-]` detaches; any number of viewers | `attach` |
+| `resize NAME ROWS COLS` | resize the PTY; the program gets `SIGWINCH` | `resize-window` |
+| `rename NAME NEW` | rename a session | `rename-session` |
+| `kill NAME` | kill the program, its children and its orphans | `kill-session` |
+| `shutdown` | kill every session and stop the daemon | `kill-server` |
+
+The working directory and environment come from the command itself: `xumux spawn job 'cd /srv && DEBUG=1 exec ./run'`.
+
+**Deliberately left out:** split panes, window layouts, the status bar, copy mode, key bindings and the config language. Those are tmux's user interface, and your terminal app or window manager already does them. Open `xumux attach` in as many tabs or splits as you like.
+
+## Benchmarks
+
+Intel Core i5-14500 (20 threads), Linux 6.14, Rust 1.97, release build. Latencies are measured over the raw socket unless noted, 10,000 samples after warm-up.
+
+| Benchmark | Result |
+|---|---|
+| Daemon start → accepting connections | **2.5 ms** |
+| Idle daemon memory (RSS) | **2.5 MiB** |
+| `list` round trip | **220 µs** median · 359 µs p99 |
+| `send` round trip | **217 µs** median · 328 µs p99 |
+| `info` round trip | **224 µs** median · 363 µs p99 |
+| `screen` round trip (full 40×120 screen) | **309 µs** median · 445 µs p99 |
+| `xumux list` from a shell (process start + request) | **3.2 ms** median |
+| Throughput, 16 concurrent clients | **15,700 requests/s** |
+| `spawn` (PTY + `posix_spawn`), with 200 sessions open | **1.6 ms** median · 18.9 ms p99 |
+| Spawn → first output seen by `wait` | **12 ms** median |
+| Daemon with 250 sessions open | **26.9 MiB** RSS · 2 threads per running session |
+| `kill` (whole process tree, reaped) | **18 ms** median |
+| Output throughput, PTY → emulator (200 MiB) | **68–77 MiB/s** |
+
+Reproduce with:
 
 ```sh
-xumux serve
+cargo test --release --test bench -- --ignored --nocapture --test-threads=1
 ```
 
-Then from anywhere, as the same user:
+Two design choices behind these numbers:
+
+- **`spawn` never forks the daemon.** Programs start as `/proc/self/exe __pty-exec CMD` via `posix_spawn`, and that helper takes the terminal and then execs the shell. `fork()` copies the parent's memory map, and the daemon's grows with every session: `spawn` used to take 12 ms with 200 sessions open, and now takes 1.6 ms at any count.
+- **Nothing waits on anything slow.** Each session has a writer thread with a bounded input queue, and each attached viewer has its own sender with a bounded output queue. A program that doesn't read its input, or a viewer that doesn't read its output, can't stall the session or the daemon.
+
+## Security
+
+The threat model has two parts: other users on the same machine, and hostile programs running inside sessions. Anyone who can connect to your socket can run commands as you; that's what the tool is for, and it's the same trust model as tmux. xumux makes sure nobody else can connect, and that programs can't escape through the terminal.
+
+**Guarantees, each tested in [`tests/security.rs`](tests/security.rs):**
+
+- **Private socket.** The socket is mode `0600`. Its directory must be a real directory (not a symlink) that you own, with mode `700`, or xumux refuses to run. That stops anyone from pre-creating or swapping the socket. Without `$XDG_RUNTIME_DIR` it uses `/tmp/xumux-$UID`, created with mode `0700`.
+- **Peer check.** Every connection's uid is verified with `SO_PEERCRED`, on top of the file permissions.
+- **Bounded protocol.** Requests are capped at 1 MiB, must be UTF-8, and must arrive within 5 s in total, so sending one byte at a time doesn't help. Idle connections can't pin threads, and error replies always reach the client.
+- **No fd leaks.** Every descriptor is close-on-exec. A program sees exactly stdin, stdout and stderr on its own PTY: never another session's terminal, the socket, or a log file.
+- **Real isolation per session.** Each program leads its own session with its own controlling terminal. `kill` takes down its descendants, plus orphans that were reparented away but kept the session id.
+- **Terminal output can't attack the reader.** `screen`, `history` and window titles never contain control characters. C1 controls (`U+009B` is CSI on some terminals) and bidi overrides ("Trojan Source") are dropped, so printing `xumux screen` is safe.
+- **Hostile programs can't stall xumux.** Query floods, output floods, raw `/dev/urandom`, unread input and stalled viewers are all tested. Pending input is capped at 4 MiB per session.
+- **Safe logging.** `log` opens only regular files, non-blocking, with mode `0600`. A FIFO with no reader fails right away instead of hanging the session.
+
+**Found and fixed during the audit:** 18 issues, 13 of them security-relevant. They include a reply-flood deadlock in raw mode, a writer thread leaked when a program stopped reading, slow-loris requests, a `/tmp` socket hijack, a group-writable socket window under `umask 002`, unbounded queued input, escape injection through `screen`, stalled viewers slowing a session, and `log` hanging on a FIFO. Each one now has a regression test.
+
+## Zero dependencies, in detail
+
+`unsafe` exists only in the `sys` module: 11 small wrappers around 10 libc functions that std already links (`ioctl`, `setsid`, `getuid`, `kill`, `getsockopt`, `fcntl`, `poll`, `tcgetattr`, `tcsetattr`, `cfmakeraw`). Each has a `SAFETY` comment. `kill` refuses pid 0, pid 1 and anything that would become negative, because those values target whole process groups. Everything else is safe Rust:
+
+- **PTYs** are opened through `/dev/ptmx` with std's `OpenOptions`, and processes are managed with std's `Command`/`Child`.
+- **The terminal emulator** handles cursor movement, erase, insert/delete, scroll regions, the alternate screen, UTF-8 and double-width characters, window titles, 10,000 lines of scrollback, and answers cursor-position and device-attribute queries. It has unit tests and a randomized stress test, because a panic would take the daemon down.
+
+The cost is that this code is ours to maintain instead of borrowed. That's the trade: there's nothing to audit but this repository.
+
+## Tests
 
 ```sh
-xumux spawn sh bash -i              # start bash in a new PTY, prints its pid
-xumux send sh 'echo hello\r'        # type into it (\r = Enter)
-xumux screen sh                     # print what's on screen
-xumux stats sh                      # CPU % and RSS of the whole process tree
-xumux list                          # name, pid, status, command
-xumux resize sh 50 160              # rows cols
-xumux kill sh
+cargo test --release          # 89 tests: unit, security, commands, swarm
+cargo test                    # the same in debug, with overflow checks
 ```
 
-Example `stats` output:
+| Suite | Tests | Covers |
+|---|---|---|
+| unit (`src/main.rs`) | 14 | emulator behavior, sanitizing, name rules, ~900,000-input stress test |
+| [`security.rs`](tests/security.rs) | 30 | socket and directory checks, protocol abuse, isolation, hostile programs |
+| [`commands.rs`](tests/commands.rs) | 37 | every command and its errors, through the socket and the real CLI |
+| [`swarm.rs`](tests/swarm.rs) | 8 | 200 concurrent sessions, 32 clients × 250 mixed commands, 300 spawn/kill cycles with leak checks, parallel floods, 20 viewers, resize storms |
 
-```
-procs	3
-cpu	100.0%
-rss	8.6 MiB
-```
+Each test runs its own daemon on its own private socket.
 
-### Commands
+## Protocol
 
-| Command                    | Effect                                                         |
-|----------------------------|----------------------------------------------------------------|
-| `spawn NAME COMMAND...`    | Run `COMMAND` via `sh -c 'exec …'` in a new 40×120 PTY, cwd `$HOME` |
-| `send NAME TEXT`           | Write `TEXT` to the PTY. Escapes: `\r \n \t \e \\ \xHH`        |
-| `screen NAME`              | Current visible screen as plain text                           |
-| `list`                     | All sessions, tab-separated                                    |
-| `stats NAME`               | Process count, CPU % (500 ms sample), total RSS                |
-| `resize NAME ROWS COLS`    | Resize the PTY and the emulator                                |
-| `kill NAME`                | Kill the process and drop the session                          |
-
-Tips:
-- Most TUIs submit on carriage return, so use `\r` rather than `\n` for Enter.
-- `\x03` is Ctrl-C, `\e` is Escape, `\e[A` is the Up arrow.
-- Quote `COMMAND` if it has its own quoting: `xumux spawn job 'python -c "print(1)"'`.
-
-### Protocol
-
-If you'd rather not shell out, talk to the socket directly. Send one line, read until EOF:
-
-```
-→ send sh echo hi\r
-← OK
-```
-```
-→ screen nope
-← ERR no session 'nope'
-```
-
-Success is `OK\n` followed by the body; failure is `ERR <message>\n`. Any language with Unix sockets can be a client:
+One line in; `OK\n<body>` or `ERR <message>\n` out; then the connection closes. Any language with Unix sockets can be a client:
 
 ```sh
 printf 'list\n' | nc -U "$XDG_RUNTIME_DIR/xumux.sock"
 ```
 
-## Security model
-
-- The socket lives at `$XUMUX_SOCK`, or else `$XDG_RUNTIME_DIR/xumux.sock`, and is created with mode `0600`. `$XDG_RUNTIME_DIR` is itself `0700` and per-user on systemd systems.
-- **Anyone who can connect can run commands as you.** That's the point, and it's the same trust model as tmux's socket. Don't put the socket somewhere other users can reach.
-- No network listener, no config file parsing, no third-party code.
-- `unsafe` is limited to the `sys` syscall wrappers plus the pre-exec hook registration.
-- All file descriptors are close-on-exec, so one session's PTY never leaks into another session's process. Each program gets its own session and controlling terminal.
-- Requests are capped at 1 MiB; PTY sizes are capped at 1000×1000; numeric escape parameters are clamped.
+`attach` is the one exception. After `OK\n` the connection carries a redraw and then raw output, and anything you write back is keystrokes. Byte `0x1d` (`Ctrl-]`) detaches.
 
 ## Limitations
 
-- Linux only, on x86, x86_64, arm, aarch64 and riscv64. `stats` reads `/proc`, and ioctl numbers are architecture-specific; other targets fail at compile time rather than misbehave.
-- Sessions live in the daemon's memory; restarting `xumux serve` kills them.
-- No attach mode: you can't take over a session interactively the way you can with `tmux attach`. It's built for programs, not people.
-- `screen` is text only: colors and styles are parsed and dropped, and so are combining accents.
-- No scrollback yet; `screen` shows the visible area.
-- Character widths come from a built-in table that covers CJK and common emoji. Rare symbols may be measured differently than the program expects.
-
-## Roadmap ideas
-
-- Scrollback buffer, and `wait NAME PATTERN` (block until text appears)
-- Per-session output logging to a file
-- Optional JSON replies for structured clients
-- Running `stats` continuously for whole-machine monitoring
+- **Linux only:** x86, x86_64, arm, aarch64 and riscv64. Other targets fail at compile time rather than misbehave.
+- **Sessions live in the daemon.** Restarting `xumux serve` ends them, just like `tmux kill-server`.
+- **`screen` and `history` are text only.** Colors and combining accents are dropped; `log` and `attach` keep the raw bytes, colors included.
+- **Character widths** come from a built-in table that covers CJK and common emoji. Rare symbols may be measured differently than the program expects.
 
 ## License
 
