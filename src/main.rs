@@ -7,6 +7,14 @@
 //! close. `attach` is the exception: after `OK\n` the connection becomes a raw
 //! bidirectional stream (program output out, keystrokes in).
 
+// `unsafe` is a compile error everywhere except the `sys` module, and every
+// unsafe block there must carry a SAFETY comment.
+#![deny(unsafe_code)]
+#![deny(
+    clippy::undocumented_unsafe_blocks,
+    clippy::multiple_unsafe_ops_per_block
+)]
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -32,7 +40,9 @@ use std::{env, thread};
         target_arch = "riscv64"
     )
 )))]
-compile_error!("xumux supports Linux on x86, x86_64, arm, aarch64 and riscv64 (ioctl numbers are arch-specific)");
+compile_error!(
+    "xumux supports Linux on x86, x86_64, arm, aarch64 and riscv64 (ioctl numbers are arch-specific)"
+);
 
 const USAGE: &str = "\
 usage: xumux COMMAND [ARGS]
@@ -54,10 +64,17 @@ input
                               Left Right Home End PgUp PgDn F1-F12 C-x M-x;
                               anything else is typed as text
 
+agents (one call, minimal output; see `xumux guide`)
+  run NAME MS TEXT            type TEXT + Enter, wait until quiet, print only the
+                              new output + a status line: quiet|timeout|exited(N)
+  settle NAME [MS] [IDLE_MS]  wait until output stops (default idle 300 ms)
+  wait-exit NAME MS           wait for the program to exit; prints exited(N)
+  guide                       print the agent guide (works without a daemon)
+
 output
   screen NAME                 the visible screen as text
   history NAME [LINES]        scrollback + screen (last LINES lines)
-  wait NAME MS TEXT           block until TEXT is on screen (or MS elapse)
+  wait NAME MS TEXT [|| TEXT] block until any TEXT is on screen; prints the match
   log NAME PATH|off           append raw output to PATH (mode 0600)
   stats NAME                  CPU % and RSS of the session's process tree
 
@@ -80,9 +97,12 @@ const INPUT_QUEUE: usize = 1024; // queued writes per session
 const MAX_PENDING: usize = 4 << 20; // queued input bytes per session before `send` reports "full"
 const IO_TIMEOUT: Duration = Duration::from_secs(5); // per client connection
 const WATCH_TIMEOUT: Duration = Duration::from_secs(5); // a stuck attached client is cut off
-const WATCH_QUEUE: usize = 1024; // output chunks an attached client may lag behind
+const WATCH_LAG: usize = 8 << 20; // output bytes an attached client may lag behind
+const WATCH_QUEUE: usize = 1 << 16; // hard cap on queued chunks (lag is bounded by bytes)
 const USER_HZ: f64 = 100.0; // /proc reports CPU time in USER_HZ, fixed at 100 on Linux
 const DETACH_KEY: u8 = 0x1d; // Ctrl-]
+const DEFAULT_IDLE_MS: u64 = 300; // "quiet" for run/settle
+const GUIDE: &str = include_str!("../AGENTS.md");
 /// Internal: the daemon starts programs as `/proc/self/exe __pty-exec CMD`.
 const PTY_EXEC: &str = "__pty-exec";
 
@@ -118,7 +138,9 @@ impl Input {
         self.tx.try_send(bytes).map_err(|e| {
             self.pending.fetch_sub(len, Ordering::AcqRel);
             match e {
-                TrySendError::Full(_) => "input queue full: the program is not reading its input".into(),
+                TrySendError::Full(_) => {
+                    "input queue full: the program is not reading its input".into()
+                }
                 TrySendError::Disconnected(_) => "session input is closed".into(),
             }
         })
@@ -141,7 +163,25 @@ struct Outputs {
     log: Option<(PathBuf, File)>,
     /// Attached clients. Each has its own sender thread and bounded queue, so
     /// a slow client is dropped instead of slowing the session down.
-    watchers: Vec<(u64, SyncSender<Arc<[u8]>>)>,
+    watchers: Vec<Viewer>,
+}
+
+/// One attached client: output is queued for its own sender thread.
+struct Viewer {
+    id: u64,
+    tx: SyncSender<Arc<[u8]>>,
+    lag: Arc<AtomicUsize>, // bytes queued but not yet written
+}
+
+impl Viewer {
+    /// Queue a chunk; false means the client is too far behind and must go.
+    fn push(&self, chunk: Arc<[u8]>) -> bool {
+        let n = chunk.len();
+        if self.lag.fetch_add(n, Ordering::AcqRel) + n > WATCH_LAG {
+            return false;
+        }
+        self.tx.try_send(chunk).is_ok()
+    }
 }
 
 type Sessions = Arc<Mutex<HashMap<String, Arc<Session>>>>;
@@ -157,23 +197,32 @@ fn main() {
             std::process::exit(2)
         }
         Some("serve") => serve(),
+        Some("guide") => print!("{GUIDE}"),
         Some(PTY_EXEC) => pty_exec(&args),
         Some("attach") => attach(&args),
         _ => client(&args),
     }
 }
 
-/// `$XUMUX_SOCK` is used as given (the caller owns that choice). The default
-/// locations must be a real directory owned by us and closed to everyone else,
-/// so nobody can pre-create or swap the socket.
+/// The socket's directory, wherever it is, must be a real directory owned by
+/// us and closed to everyone else. That alone keeps other users from reaching
+/// the socket, pre-creating it, or swapping it.
 fn sock_path() -> PathBuf {
     if let Ok(p) = env::var("XUMUX_SOCK") {
-        return p.into();
+        let p = PathBuf::from(p);
+        let dir = match p.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        if let Err(e) = check_private_dir(&dir) {
+            die(format!("refusing socket dir {}: {e}", dir.display()));
+        }
+        return p;
     }
     let dir = match env::var("XDG_RUNTIME_DIR") {
         Ok(d) if !d.is_empty() => PathBuf::from(d),
         _ => {
-            let d = PathBuf::from(format!("/tmp/xumux-{}", sys::uid()));
+            let d = PathBuf::from(format!("/tmp/xumux-{}", my_uid()));
             let _ = fs::DirBuilder::new().mode(0o700).create(&d);
             d
         }
@@ -189,11 +238,14 @@ fn check_private_dir(dir: &Path) -> Result<(), String> {
     if !m.is_dir() {
         return Err("not a directory (symlinks are not followed)".into());
     }
-    if m.uid() != sys::uid() {
+    if m.uid() != my_uid() {
         return Err(format!("owned by uid {}, not you", m.uid()));
     }
     if m.mode() & 0o077 != 0 {
-        return Err(format!("mode {:o} is open to group/others, want 700", m.mode() & 0o777));
+        return Err(format!(
+            "mode {:o} is open to group/others, want 700",
+            m.mode() & 0o777
+        ));
     }
     Ok(())
 }
@@ -205,8 +257,12 @@ fn die(msg: impl std::fmt::Display) -> ! {
 
 fn connect() -> UnixStream {
     let path = sock_path();
-    UnixStream::connect(&path)
-        .unwrap_or_else(|e| die(format!("{}: {e} (is `xumux serve` running?)", path.display())))
+    UnixStream::connect(&path).unwrap_or_else(|e| {
+        die(format!(
+            "{}: {e} (is `xumux serve` running?)",
+            path.display()
+        ))
+    })
 }
 
 // ---------------------------------------------------------------- client
@@ -233,7 +289,9 @@ fn client(args: &[String]) {
 }
 
 fn attach(args: &[String]) {
-    let [_, name] = args else { die("usage: attach NAME") };
+    let [_, name] = args else {
+        die("usage: attach NAME")
+    };
     let mut stream = connect();
     let (rows, cols) = sys::term_size(&io::stdout()).unwrap_or((0, 0));
     stream
@@ -272,7 +330,11 @@ fn attach(args: &[String]) {
     let mut stdout = io::stdout().lock();
     let mut buf = [0u8; 16384];
     while let Ok(n @ 1..) = stream.read(&mut buf) {
-        if stdout.write_all(&buf[..n]).and_then(|_| stdout.flush()).is_err() {
+        if stdout
+            .write_all(&buf[..n])
+            .and_then(|_| stdout.flush())
+            .is_err()
+        {
             break;
         }
     }
@@ -311,12 +373,8 @@ fn handle(stream: UnixStream, sessions: &Sessions) {
     // A client that connects and goes quiet must not pin a thread forever.
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-    // Defense in depth on top of the 0600 socket: only our own uid may talk to us.
-    let request = match sys::peer_uid(&stream) {
-        Ok(uid) if uid == sys::uid() => read_request(&stream),
-        Ok(uid) => Err(format!("permission denied for uid {uid}")),
-        Err(e) => Err(err(e)),
-    };
+    // Only our uid can reach the socket: it lives in a 0700 directory we own.
+    let request = read_request(&stream);
     let (cmd, rest) = match &request {
         Ok((line, _)) => split1(line),
         Err(_) => ("", ""),
@@ -366,7 +424,12 @@ fn read_request(stream: &UnixStream) -> Result<(String, Vec<u8>), String> {
             Ok(0) => return Err("incomplete request (no newline)".into()),
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
                 return Err("timed out".into());
             }
             Err(e) => return Err(err(e)),
@@ -394,7 +457,9 @@ fn read_request(stream: &UnixStream) -> Result<(String, Vec<u8>), String> {
 
 fn valid_name(name: &str) -> Result<(), String> {
     let ok = (1..=MAX_NAME).contains(&name.len())
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
     if ok {
         Ok(())
     } else {
@@ -447,6 +512,49 @@ fn queue_input(s: &Session, bytes: Vec<u8>) -> Result<String, String> {
     s.input.push(bytes).map(|()| String::new())
 }
 
+/// The job in the terminal's foreground, if it isn't the session's own
+/// program: `tpgid` (field 8 of /proc/PID/stat) is the foreground process
+/// group. A shell at its prompt owns the foreground; a running command doesn't.
+fn foreground_job(leader: u32) -> Option<(u32, String)> {
+    let stat = fs::read_to_string(format!("/proc/{leader}/stat")).ok()?;
+    let tpgid: i64 = stat[stat.rfind(')')? + 1..]
+        .split_whitespace()
+        .nth(5)?
+        .parse()
+        .ok()?;
+    if tpgid <= 0 || tpgid == i64::from(leader) {
+        return None;
+    }
+    let comm = fs::read_to_string(format!("/proc/{tpgid}/comm")).unwrap_or_default();
+    Some((tpgid as u32, comm.trim().to_string()))
+}
+
+/// Wait until the session is done: no foreground job is running and output
+/// has been quiet for `idle_ms` (counted from the call at the earliest).
+/// Returns quiet | exited(N) | timeout[: CMD still running].
+fn settle(s: &Session, timeout_ms: u64, idle_ms: u64) -> String {
+    let begin = Instant::now();
+    let deadline = begin + Duration::from_millis(timeout_ms.min(MAX_WAIT_MS));
+    let idle = Duration::from_millis(idle_ms.clamp(10, 60_000));
+    loop {
+        thread::sleep(Duration::from_millis(10));
+        if s.closed.load(Ordering::Acquire) {
+            return status(s);
+        }
+        let job = foreground_job(s.pid);
+        let last = s.term.lock().unwrap().last_output.max(begin);
+        if job.is_none() && last.elapsed() >= idle {
+            return "quiet".into();
+        }
+        if Instant::now() >= deadline {
+            return match job {
+                Some((_, comm)) => format!("timeout: {comm} still running"),
+                None => "timeout".into(),
+            };
+        }
+    }
+}
+
 fn resize_session(s: &Session, rows: u16, cols: u16) -> Result<(), String> {
     sys::set_size(&s.master, rows, cols).map_err(err)?;
     s.term.lock().unwrap().resize(rows.into(), cols.into());
@@ -460,7 +568,11 @@ fn kill_session(s: &Session) {
     let mut child = s.child.lock().unwrap();
     let alive = matches!(child.try_wait(), Ok(None));
     let all = procs();
-    let mut doomed: Vec<u32> = all.iter().filter(|p| p.sid == s.pid).map(|p| p.pid).collect();
+    let mut doomed: Vec<u32> = all
+        .iter()
+        .filter(|p| p.sid == s.pid)
+        .map(|p| p.pid)
+        .collect();
     if alive {
         doomed.extend(tree_of(&all, s.pid).into_keys());
     }
@@ -505,7 +617,10 @@ fn dispatch(line: &str, sessions: &Sessions) -> Result<String, String> {
             let mut it = rest.split_whitespace();
             let s = get(sessions, it.next().unwrap_or(""))?;
             let lines = match it.next() {
-                Some(n) => Some(n.parse::<usize>().map_err(|_| format!("bad line count '{n}'"))?),
+                Some(n) => Some(
+                    n.parse::<usize>()
+                        .map_err(|_| format!("bad line count '{n}'"))?,
+                ),
                 None => None,
             };
             let text = s.term.lock().unwrap().history_text(lines);
@@ -514,15 +629,19 @@ fn dispatch(line: &str, sessions: &Sessions) -> Result<String, String> {
         "wait" => {
             let (name, rest) = split1(rest);
             let (ms, text) = split1(rest);
-            let ms: u64 = ms.parse().map_err(|_| "usage: wait NAME MS TEXT")?;
-            if text.is_empty() {
-                return Err("usage: wait NAME MS TEXT".into());
+            let ms: u64 = ms
+                .parse()
+                .map_err(|_| "usage: wait NAME MS TEXT [|| TEXT...]")?;
+            let wanted: Vec<&str> = text.split(" || ").filter(|t| !t.is_empty()).collect();
+            if wanted.is_empty() {
+                return Err("usage: wait NAME MS TEXT [|| TEXT...]".into());
             }
             let s = get(sessions, name)?;
             let deadline = Instant::now() + Duration::from_millis(ms.min(MAX_WAIT_MS));
             loop {
-                if s.term.lock().unwrap().contents().contains(text) {
-                    return Ok(String::new());
+                let screen = s.term.lock().unwrap().contents();
+                if let Some(hit) = wanted.iter().find(|w| screen.contains(**w)) {
+                    return Ok(format!("{hit}\n"));
                 }
                 // `closed`, not the exit status: output can still be in flight
                 // when the process exits.
@@ -535,6 +654,53 @@ fn dispatch(line: &str, sessions: &Sessions) -> Result<String, String> {
                 thread::sleep(Duration::from_millis(10));
             }
         }
+        "run" => {
+            let (name, rest) = split1(rest);
+            let (ms, text) = split1(rest);
+            let ms: u64 = ms.parse().map_err(|_| "usage: run NAME MS TEXT")?;
+            let s = get(sessions, name)?;
+            let start = s.term.lock().unwrap().mark();
+            let mut bytes = unescape(text)?;
+            bytes.push(b'\r');
+            queue_input(&s, bytes)?;
+            let status = settle(&s, ms, DEFAULT_IDLE_MS);
+            let out = s.term.lock().unwrap().since(start);
+            Ok(format!("{out}\n[xumux] {status}\n"))
+        }
+        "settle" => {
+            let mut it = rest.split_whitespace();
+            let s = get(sessions, it.next().unwrap_or(""))?;
+            let num = |v: Option<&str>, default: u64| match v {
+                None => Ok(default),
+                Some(v) => v
+                    .parse::<u64>()
+                    .map_err(|_| "usage: settle NAME MS [IDLE_MS]".to_string()),
+            };
+            let ms = num(it.next(), 10_000)?;
+            let idle = num(it.next(), DEFAULT_IDLE_MS)?;
+            Ok(format!("{}\n", settle(&s, ms, idle)))
+        }
+        "wait-exit" => {
+            let mut it = rest.split_whitespace();
+            let s = get(sessions, it.next().unwrap_or(""))?;
+            let ms: u64 = it
+                .next()
+                .unwrap_or("")
+                .parse()
+                .map_err(|_| "usage: wait-exit NAME MS")?;
+            let deadline = Instant::now() + Duration::from_millis(ms.min(MAX_WAIT_MS));
+            loop {
+                let st = status(&s);
+                if st != "running" {
+                    return Ok(format!("{st}\n"));
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!("timed out after {ms} ms: still running"));
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        "guide" => Ok(GUIDE.to_string()),
         "list" => {
             let map = sessions.lock().unwrap();
             let mut names: Vec<_> = map.keys().collect();
@@ -550,9 +716,14 @@ fn dispatch(line: &str, sessions: &Sessions) -> Result<String, String> {
             let s = get(sessions, rest.trim())?;
             let o = s.out.lock().unwrap();
             let t = s.term.lock().unwrap();
-            let log = o.log.as_ref().map_or("-".into(), |(p, _)| p.display().to_string());
+            let log = o
+                .log
+                .as_ref()
+                .map_or("-".into(), |(p, _)| p.display().to_string());
+            let fg =
+                foreground_job(s.pid).map_or("-".into(), |(pid, comm)| format!("{comm} ({pid})"));
             Ok(format!(
-                "pid\t{}\nstatus\t{}\nsize\t{}x{}\ncursor\t{},{}\nalt_screen\t{}\ntitle\t{}\nhistory\t{}\nattached\t{}\nlog\t{log}\ncommand\t{}\n",
+                "pid\t{}\nstatus\t{}\nforeground\t{fg}\nsize\t{}x{}\ncursor\t{},{}\nalt_screen\t{}\ntitle\t{}\nhistory\t{}\nattached\t{}\nlog\t{log}\ncommand\t{}\n",
                 s.pid,
                 status(&s),
                 t.rows,
@@ -612,7 +783,9 @@ fn dispatch(line: &str, sessions: &Sessions) -> Result<String, String> {
             if map.contains_key(new) {
                 return Err(format!("session '{new}' already exists"));
             }
-            let s = map.remove(old).ok_or_else(|| format!("no session '{old}'"))?;
+            let s = map
+                .remove(old)
+                .ok_or_else(|| format!("no session '{old}'"))?;
             map.insert(new.to_string(), s);
             Ok(String::new())
         }
@@ -638,7 +811,12 @@ fn dispatch(line: &str, sessions: &Sessions) -> Result<String, String> {
     }
 }
 
-fn serve_attach(stream: &UnixStream, rest: &str, typed: &[u8], sessions: &Sessions) -> Result<(), String> {
+fn serve_attach(
+    stream: &UnixStream,
+    rest: &str,
+    typed: &[u8],
+    sessions: &Sessions,
+) -> Result<(), String> {
     let mut it = rest.split_whitespace();
     let s = get(sessions, it.next().unwrap_or(""))?;
     // The client sends its own size; "0 0" means unknown (not a terminal).
@@ -649,11 +827,14 @@ fn serve_attach(stream: &UnixStream, rest: &str, typed: &[u8], sessions: &Sessio
     out.set_write_timeout(Some(WATCH_TIMEOUT)).map_err(err)?;
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = sync_channel::<Arc<[u8]>>(WATCH_QUEUE);
+    let lag: Arc<AtomicUsize> = Default::default();
+    let written = lag.clone();
     thread::spawn(move || {
         for chunk in rx {
             if out.write_all(&chunk).is_err() {
                 break;
             }
+            written.fetch_sub(chunk.len(), Ordering::AcqRel);
         }
         let _ = out.shutdown(Shutdown::Both); // dropped, detached or session over
     });
@@ -663,8 +844,11 @@ fn serve_attach(stream: &UnixStream, rest: &str, typed: &[u8], sessions: &Sessio
         let mut o = s.out.lock().unwrap();
         let mut first = b"OK\n".to_vec();
         first.extend_from_slice(s.term.lock().unwrap().redraw().as_bytes());
-        tx.try_send(first.into()).map_err(err)?;
-        o.watchers.push((id, tx));
+        let viewer = Viewer { id, tx, lag };
+        if !viewer.push(first.into()) {
+            return Err("cannot queue the initial redraw".into());
+        }
+        o.watchers.push(viewer);
     }
     let _ = stream.set_read_timeout(None);
     // Ctrl-] (DETACH_KEY) detaches. Plain end of input only means the client
@@ -679,7 +863,7 @@ fn serve_attach(stream: &UnixStream, rest: &str, typed: &[u8], sessions: &Sessio
             break;
         }
         if detach.is_some() {
-            s.out.lock().unwrap().watchers.retain(|(w, _)| *w != id);
+            s.out.lock().unwrap().watchers.retain(|v| v.id != id);
             let _ = stream.shutdown(Shutdown::Both);
             break;
         }
@@ -694,20 +878,25 @@ fn serve_attach(stream: &UnixStream, rest: &str, typed: &[u8], sessions: &Sessio
 /// Runs in the new child, whose stdio is already the PTY: start a session,
 /// take the PTY as controlling terminal, become `sh -c 'exec COMMAND'`.
 fn pty_exec(args: &[String]) -> ! {
-    let [_, command] = args else { die("internal command") };
+    let [_, command] = args else {
+        die("internal command")
+    };
     if let Err(e) = sys::make_controlling_tty() {
         die(format!("cannot take the terminal: {e}"));
     }
-    let e = Command::new("/bin/sh").arg("-c").arg(format!("exec {command}")).exec();
+    let e = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("exec {command}"))
+        .exec();
     die(format!("/bin/sh: {e}"))
 }
 
-fn open_pty_dev(path: &str) -> io::Result<File> {
+fn open_pty_dev(path: &str, flags: i32) -> io::Result<File> {
     // std always adds O_CLOEXEC, so PTY fds never leak into other sessions' children.
     OpenOptions::new()
         .read(true)
         .write(true)
-        .custom_flags(sys::O_NOCTTY)
+        .custom_flags(sys::O_NOCTTY | flags)
         .open(path)
 }
 
@@ -715,10 +904,13 @@ fn spawn(name: &str, command: &str, sessions: &Sessions) -> Result<String, Strin
     if sessions.lock().unwrap().contains_key(name) {
         return Err(format!("session '{name}' already exists"));
     }
-    let master = open_pty_dev("/dev/ptmx").map_err(err)?;
-    let n = sys::unlock_and_number(&master).map_err(err)?;
+    // O_NONBLOCK: both I/O threads wait in poll(); a blocking write to a PTY
+    // whose program is gone is never woken by Linux.
+    let master = open_pty_dev("/dev/ptmx", sys::O_NONBLOCK).map_err(err)?;
+    sys::unlock_pty(&master).map_err(err)?;
+    let n = pty_number(&master)?;
     sys::set_size(&master, ROWS, COLS).map_err(err)?;
-    let slave = open_pty_dev(&format!("/dev/pts/{n}")).map_err(err)?;
+    let slave = open_pty_dev(&format!("/dev/pts/{n}"), 0).map_err(err)?;
 
     // No pre_exec hook, so std can use posix_spawn (CLONE_VM) instead of
     // fork(): fork has to copy the daemon's memory map, which grows with every
@@ -736,15 +928,15 @@ fn spawn(name: &str, command: &str, sessions: &Sessions) -> Result<String, Strin
     let mut child = cmd.spawn().map_err(err)?;
     drop(cmd); // close our copies of the slave so reads hit EOF/EIO when the child exits
 
-    // The master is non-blocking and both threads wait in poll(). A blocking
-    // write to a PTY whose program is gone is never woken by Linux, so the
-    // writer must be able to notice `closed` and give up.
-    sys::set_nonblocking(&master).map_err(err)?;
+    // The writer must be able to notice `closed` and give up.
     let closed = Arc::new(AtomicBool::new(false));
 
     // Writer thread: the only place that waits on the program's input.
     let (tx, queue) = sync_channel::<Vec<u8>>(INPUT_QUEUE);
-    let input = Input { tx, pending: Default::default() };
+    let input = Input {
+        tx,
+        pending: Default::default(),
+    };
     let mut writer = master.try_clone().map_err(err)?;
     let (gone, pending) = (closed.clone(), input.pending.clone());
     thread::spawn(move || {
@@ -809,7 +1001,7 @@ fn spawn(name: &str, command: &str, sessions: &Sessions) -> Result<String, Strin
             if !o.watchers.is_empty() {
                 let shared: Arc<[u8]> = chunk.into();
                 // a client too far behind is dropped; it can re-attach for a fresh redraw
-                o.watchers.retain(|(_, w)| w.try_send(shared.clone()).is_ok());
+                o.watchers.retain(|v| v.push(shared.clone()));
             }
         }
         done.store(true, Ordering::Release);
@@ -949,9 +1141,16 @@ fn unescape(s: &str) -> Result<Vec<u8>, String> {
 
 // ---------------------------------------------------------------- kernel interface
 //
-// The only `unsafe` in xumux. Ten libc symbols, already linked by std, and constants from
-// <asm-generic/ioctls.h> and <asm-generic/socket.h>.
+// The only `unsafe` in xumux, enforced by `#![deny(unsafe_code)]`: the PTY and
+// terminal operations std has no API for. Seven libc functions (already linked
+// by std). Each unsafe block makes exactly one call, and every pointer passed
+// points to a live local of the exact type the kernel expects.
+//
+// Things that do NOT need unsafe are done in safe Rust instead: the uid comes
+// from /proc/self/status, the PTY number from /proc/self/fdinfo, non-blocking
+// mode from OpenOptions, and socket privacy from directory checks.
 
+#[allow(unsafe_code)]
 mod sys {
     use std::ffi::{c_int, c_ulong, c_void};
     use std::io;
@@ -960,20 +1159,114 @@ mod sys {
     unsafe extern "C" {
         fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
         fn setsid() -> c_int;
-        fn getuid() -> u32;
         fn kill(pid: c_int, sig: c_int) -> c_int;
-        fn getsockopt(fd: c_int, level: c_int, name: c_int, val: *mut c_void, len: *mut u32) -> c_int;
-        fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
         fn poll(fds: *mut PollFd, nfds: u64, timeout_ms: c_int) -> c_int;
         fn tcgetattr(fd: c_int, termios: *mut c_void) -> c_int;
         fn tcsetattr(fd: c_int, action: c_int, termios: *const c_void) -> c_int;
         fn cfmakeraw(termios: *mut c_void);
     }
 
-    /// `struct termios` is treated as an opaque blob (it is 60 bytes on Linux);
-    /// we only ever hand it back to libc, so its layout never matters here.
-    type Termios = [u64; 16];
+    // <asm-generic/ioctls.h>, <asm-generic/fcntl.h>, <asm-generic/poll.h>
+    pub const O_NOCTTY: c_int = 0o400;
+    pub const O_NONBLOCK: c_int = 0o4000;
+    pub const POLLIN: i16 = 0x1;
+    pub const POLLOUT: i16 = 0x4;
+    const TIOCSCTTY: c_ulong = 0x540E;
+    const TIOCGWINSZ: c_ulong = 0x5413;
+    const TIOCSWINSZ: c_ulong = 0x5414;
+    const TIOCSPTLCK: c_ulong = 0x4004_5431; // _IOW('T', 0x31, int)
+    const SIGKILL: c_int = 9;
     const TCSANOW: c_int = 0;
+
+    #[repr(C)]
+    struct Winsize {
+        rows: u16,
+        cols: u16,
+        xpixel: u16,
+        ypixel: u16,
+    }
+
+    #[repr(C)]
+    pub struct PollFd {
+        fd: c_int,
+        events: i16,
+        revents: i16,
+    }
+
+    /// `struct termios` as an opaque, over-sized, 8-aligned blob (the real one
+    /// is 60 bytes): we only hand it back to libc, so its layout never matters.
+    type Termios = [u64; 16];
+
+    fn check(r: c_int) -> io::Result<()> {
+        if r == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Unlock a freshly opened /dev/ptmx so its /dev/pts/N can be opened.
+    pub fn unlock_pty(master: &impl AsRawFd) -> io::Result<()> {
+        let unlock: c_int = 0;
+        // SAFETY: valid fd; TIOCSPTLCK reads one c_int through the pointer,
+        // which points to a live local c_int.
+        check(unsafe { ioctl(master.as_raw_fd(), TIOCSPTLCK, &unlock as *const c_int) })
+    }
+
+    pub fn set_size(master: &impl AsRawFd, rows: u16, cols: u16) -> io::Result<()> {
+        let ws = Winsize {
+            rows,
+            cols,
+            xpixel: 0,
+            ypixel: 0,
+        };
+        // SAFETY: valid fd; TIOCSWINSZ reads one struct winsize through the
+        // pointer, which points to a live, #[repr(C)] winsize.
+        check(unsafe { ioctl(master.as_raw_fd(), TIOCSWINSZ, &ws as *const Winsize) })
+    }
+
+    /// (rows, cols) of a terminal.
+    pub fn term_size(tty: &impl AsRawFd) -> Option<(u16, u16)> {
+        let mut ws = Winsize {
+            rows: 0,
+            cols: 0,
+            xpixel: 0,
+            ypixel: 0,
+        };
+        // SAFETY: valid fd; TIOCGWINSZ writes one struct winsize through the
+        // pointer, which points to a live, #[repr(C)] winsize we own.
+        let r = unsafe { ioctl(tty.as_raw_fd(), TIOCGWINSZ, &mut ws as *mut Winsize) };
+        (r == 0 && ws.rows > 0 && ws.cols > 0).then_some((ws.rows, ws.cols))
+    }
+
+    /// Start a new session and adopt stdin (a PTY slave) as the controlling terminal.
+    pub fn make_controlling_tty() -> io::Result<()> {
+        // SAFETY: no arguments, no memory involved.
+        check(unsafe { setsid() })?;
+        // SAFETY: integer arguments only; fd 0 is ours.
+        check(unsafe { ioctl(0, TIOCSCTTY, 0 as c_int) })
+    }
+
+    /// SIGKILL one process. Refuses pid 0, 1 and anything that would wrap to a
+    /// negative pid, since kill(0|-1|-n) targets whole process groups.
+    pub fn kill_pid(pid: u32) {
+        if let Ok(p @ 2..) = c_int::try_from(pid) {
+            // SAFETY: integer arguments only, pid checked to be >= 2.
+            unsafe { kill(p, SIGKILL) };
+        }
+    }
+
+    /// Wait until `f` is ready for `events` (or hung up), up to `timeout_ms`
+    /// (-1 = forever). EINTR counts as a spurious wakeup.
+    pub fn wait_ready(f: &impl AsRawFd, events: i16, timeout_ms: c_int) {
+        let mut p = PollFd {
+            fd: f.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        // SAFETY: nfds = 1 and the pointer is to one live, #[repr(C)] pollfd.
+        unsafe { poll(&mut p, 1, timeout_ms) };
+    }
 
     /// Puts a terminal in raw mode; the original settings come back on drop.
     pub struct RawMode {
@@ -985,16 +1278,17 @@ mod sys {
         pub fn enter(tty: &impl AsRawFd) -> Option<RawMode> {
             let fd = tty.as_raw_fd();
             let mut saved: Termios = [0; 16];
-            // SAFETY: the buffer is larger and more aligned than struct termios.
-            unsafe {
-                if tcgetattr(fd, saved.as_mut_ptr().cast()) != 0 {
-                    return None; // not a terminal
-                }
-                let mut raw = saved;
-                cfmakeraw(raw.as_mut_ptr().cast());
-                if tcsetattr(fd, TCSANOW, raw.as_ptr().cast()) != 0 {
-                    return None;
-                }
+            // SAFETY: tcgetattr writes sizeof(struct termios) = 60 bytes; the
+            // buffer is 128 bytes and 8-aligned.
+            if unsafe { tcgetattr(fd, saved.as_mut_ptr().cast()) } != 0 {
+                return None; // not a terminal
+            }
+            let mut raw = saved;
+            // SAFETY: same buffer contract; cfmakeraw only edits the struct.
+            unsafe { cfmakeraw(raw.as_mut_ptr().cast()) };
+            // SAFETY: tcsetattr reads a termios from a buffer tcgetattr filled.
+            if unsafe { tcsetattr(fd, TCSANOW, raw.as_ptr().cast()) } != 0 {
+                return None;
             }
             Some(RawMode { fd, saved })
         }
@@ -1002,131 +1296,35 @@ mod sys {
 
     impl Drop for RawMode {
         fn drop(&mut self) {
-            // SAFETY: restores the settings tcgetattr filled in.
+            // SAFETY: restores the termios tcgetattr filled in.
             unsafe { tcsetattr(self.fd, TCSANOW, self.saved.as_ptr().cast()) };
         }
     }
+}
 
-    /// (rows, cols) of a terminal.
-    pub fn term_size(tty: &impl AsRawFd) -> Option<(u16, u16)> {
-        let mut ws = Winsize { rows: 0, cols: 0, xpixel: 0, ypixel: 0 };
-        // SAFETY: valid fd; pointer to a live winsize.
-        let r = unsafe { ioctl(tty.as_raw_fd(), TIOCGWINSZ, &mut ws as *mut Winsize) };
-        (r == 0 && ws.rows > 0 && ws.cols > 0).then_some((ws.rows, ws.cols))
-    }
+/// Our real uid, from /proc/self/status (no syscall needed).
+fn my_uid() -> u32 {
+    static UID: OnceLock<u32> = OnceLock::new();
+    *UID.get_or_init(|| {
+        fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                let line = s.lines().find(|l| l.starts_with("Uid:"))?;
+                line.split_whitespace().nth(1)?.parse().ok()
+            })
+            .unwrap_or_else(|| die("cannot read uid from /proc/self/status"))
+    })
+}
 
-    const F_GETFL: c_int = 3;
-    const F_SETFL: c_int = 4;
-    pub const O_NONBLOCK: c_int = 0o4000;
-    pub const POLLIN: i16 = 0x1;
-    pub const POLLOUT: i16 = 0x4;
-
-    #[repr(C)]
-    pub struct PollFd {
-        fd: c_int,
-        events: i16,
-        revents: i16,
-    }
-
-    pub fn set_nonblocking(f: &impl AsRawFd) -> io::Result<()> {
-        // SAFETY: valid fd; integer-only fcntl commands.
-        unsafe {
-            let flags = fcntl(f.as_raw_fd(), F_GETFL);
-            check(flags)?;
-            check(fcntl(f.as_raw_fd(), F_SETFL, flags | O_NONBLOCK))
-        }
-    }
-
-    /// Wait until `f` is ready for `events` (or hung up), up to `timeout_ms`
-    /// (-1 = forever). EINTR counts as a spurious wakeup.
-    pub fn wait_ready(f: &impl AsRawFd, events: i16, timeout_ms: c_int) {
-        let mut p = PollFd { fd: f.as_raw_fd(), events, revents: 0 };
-        // SAFETY: one live, correctly laid out pollfd.
-        unsafe { poll(&mut p, 1, timeout_ms) };
-    }
-
-    const SIGKILL: c_int = 9;
-    const SOL_SOCKET: c_int = 1;
-    const SO_PEERCRED: c_int = 17;
-
-    #[repr(C)]
-    struct Ucred {
-        pid: i32,
-        uid: u32,
-        gid: u32,
-    }
-
-    pub fn uid() -> u32 {
-        // SAFETY: getuid takes no arguments and cannot fail.
-        unsafe { getuid() }
-    }
-
-    /// SIGKILL one process. Refuses pid 0, 1 and anything that would wrap to a
-    /// negative pid, since kill(0|-1|-n) target whole process groups.
-    pub fn kill_pid(pid: u32) {
-        if let Ok(p @ 2..) = c_int::try_from(pid) {
-            // SAFETY: plain syscall with a positive pid.
-            unsafe { kill(p, SIGKILL) };
-        }
-    }
-
-    /// The uid of the process on the other end of a Unix socket (SO_PEERCRED).
-    pub fn peer_uid(sock: &impl AsRawFd) -> io::Result<u32> {
-        let mut cred = Ucred { pid: 0, uid: u32::MAX, gid: u32::MAX };
-        let mut len = std::mem::size_of::<Ucred>() as u32;
-        // SAFETY: valid fd; cred/len point to live locals and len holds cred's size.
-        check(unsafe {
-            getsockopt(sock.as_raw_fd(), SOL_SOCKET, SO_PEERCRED, (&mut cred as *mut Ucred).cast(), &mut len)
-        })?;
-        Ok(cred.uid)
-    }
-
-    pub const O_NOCTTY: i32 = 0o400;
-    const TIOCSCTTY: c_ulong = 0x540E;
-    const TIOCGWINSZ: c_ulong = 0x5413;
-    const TIOCSWINSZ: c_ulong = 0x5414;
-    const TIOCGPTN: c_ulong = 0x8004_5430; // _IOR('T', 0x30, unsigned int)
-    const TIOCSPTLCK: c_ulong = 0x4004_5431; // _IOW('T', 0x31, int)
-
-    #[repr(C)]
-    struct Winsize {
-        rows: u16,
-        cols: u16,
-        xpixel: u16,
-        ypixel: u16,
-    }
-
-    fn check(r: c_int) -> io::Result<()> {
-        if r == -1 { Err(io::Error::last_os_error()) } else { Ok(()) }
-    }
-
-    /// Unlock a freshly opened /dev/ptmx and return its /dev/pts number.
-    pub fn unlock_and_number(master: &impl AsRawFd) -> io::Result<u32> {
-        let unlock: c_int = 0;
-        let mut n: u32 = 0;
-        // SAFETY: valid open fd; the pointers refer to live locals of the types
-        // these requests expect.
-        unsafe {
-            check(ioctl(master.as_raw_fd(), TIOCSPTLCK, &unlock as *const c_int))?;
-            check(ioctl(master.as_raw_fd(), TIOCGPTN, &mut n as *mut u32))?;
-        }
-        Ok(n)
-    }
-
-    pub fn set_size(master: &impl AsRawFd, rows: u16, cols: u16) -> io::Result<()> {
-        let ws = Winsize { rows, cols, xpixel: 0, ypixel: 0 };
-        // SAFETY: valid open fd; pointer to a live, correctly laid out winsize.
-        unsafe { check(ioctl(master.as_raw_fd(), TIOCSWINSZ, &ws as *const Winsize)) }
-    }
-
-    /// Start a new session and adopt stdin (a PTY slave) as the controlling terminal.
-    pub fn make_controlling_tty() -> io::Result<()> {
-        // SAFETY: plain syscalls with integer arguments.
-        unsafe {
-            check(setsid())?;
-            check(ioctl(0, TIOCSCTTY, 0 as c_int))
-        }
-    }
+/// The /dev/pts number of an open /dev/ptmx, from /proc/self/fdinfo.
+fn pty_number(master: &File) -> Result<u32, String> {
+    use std::os::fd::AsRawFd;
+    let info =
+        fs::read_to_string(format!("/proc/self/fdinfo/{}", master.as_raw_fd())).map_err(err)?;
+    info.lines()
+        .find_map(|l| l.strip_prefix("tty-index:"))
+        .and_then(|n| n.trim().parse().ok())
+        .ok_or_else(|| "kernel does not report tty-index in fdinfo".into())
 }
 
 // ---------------------------------------------------------------- terminal emulator
@@ -1165,9 +1363,12 @@ struct Term {
     params: String,
     utf8: Vec<u8>,
     utf8_need: usize,
-    reply: Vec<u8>, // bytes to send back to the program
+    reply: Vec<u8>,            // bytes to send back to the program
     history: VecDeque<String>, // lines scrolled off the top of the main screen
-    title: String,             // set by OSC 0 / OSC 2
+    scrolled: u64,             // lines ever pushed to history (absolute line numbers)
+    touched: u64,              // topmost absolute line written since the last mark()
+    last_output: Instant,
+    title: String, // set by OSC 0 / OSC 2
     osc: Vec<u8>,
 }
 
@@ -1225,6 +1426,9 @@ impl Term {
             utf8_need: 0,
             reply: Vec::new(),
             history: VecDeque::new(),
+            scrolled: 0,
+            touched: u64::MAX,
+            last_output: Instant::now(),
             title: String::new(),
             osc: Vec::new(),
         }
@@ -1264,7 +1468,10 @@ impl Term {
     fn osc_done(&mut self) {
         let payload = String::from_utf8_lossy(&self.osc).into_owned();
         self.osc.clear();
-        if let Some(t) = payload.strip_prefix("0;").or_else(|| payload.strip_prefix("2;")) {
+        if let Some(t) = payload
+            .strip_prefix("0;")
+            .or_else(|| payload.strip_prefix("2;"))
+        {
             self.title = t.chars().filter(|&c| width(c) > 0).take(256).collect();
         }
     }
@@ -1301,7 +1508,37 @@ impl Term {
         self.wrap_pending = false;
     }
 
+    /// Absolute line number of the cursor, for `since`.
+    fn mark(&mut self) -> u64 {
+        self.touched = u64::MAX;
+        self.scrolled + self.row as u64
+    }
+
+    fn touch(&mut self, row: usize) {
+        self.touched = self.touched.min(self.scrolled + row as u64);
+    }
+
+    /// Lines from absolute line `mark` to the end of the screen. A program
+    /// that redrew above that line (full-screen TUIs, `clear`) gets the whole
+    /// screen instead.
+    fn since(&self, mark: u64) -> String {
+        let screen = self.contents();
+        if self.main.is_some() || self.touched < mark {
+            return screen;
+        }
+        let first = self.scrolled - self.history.len() as u64;
+        let all: Vec<&str> = self
+            .history
+            .iter()
+            .map(String::as_str)
+            .chain(screen.lines())
+            .collect();
+        let start = (mark.saturating_sub(first) as usize).min(all.len());
+        all[start..].join("\n")
+    }
+
     fn feed(&mut self, bytes: &[u8]) {
+        self.last_output = Instant::now();
         for &b in bytes {
             self.byte(b);
         }
@@ -1426,9 +1663,9 @@ impl Term {
             }
             b'M' => self.reverse_index(),
             b'c' => {
-                let history = std::mem::take(&mut self.history);
+                let (history, scrolled) = (std::mem::take(&mut self.history), self.scrolled);
                 *self = Term::new(self.rows, self.cols);
-                self.history = history;
+                (self.history, self.scrolled) = (history, scrolled);
             }
             _ => {}
         }
@@ -1443,7 +1680,14 @@ impl Term {
         let nums: Vec<usize> = params
             .trim_start_matches(['?', '<', '=', '>'])
             .split(';')
-            .map(|p| p.split(':').next().unwrap_or("").parse().unwrap_or(0).min(65535))
+            .map(|p| {
+                p.split(':')
+                    .next()
+                    .unwrap_or("")
+                    .parse()
+                    .unwrap_or(0)
+                    .min(65535)
+            })
             .collect();
         let p = |i: usize| nums.get(i).copied().unwrap_or(0);
         let n = p(0).max(1);
@@ -1479,18 +1723,24 @@ impl Term {
                 self.row = (n - 1).min(rows - 1);
                 self.col = (p(1).max(1) - 1).min(cols - 1);
             }
-            (None, b'J') => match p(0) {
-                0 => self.grid[cur..].fill(' '),
-                1 => self.grid[..=cur].fill(' '),
-                2 | 3 => self.grid.fill(' '),
-                _ => {}
-            },
-            (None, b'K') => match p(0) {
-                0 => self.grid[cur..line + cols].fill(' '),
-                1 => self.grid[line..=cur].fill(' '),
-                2 => self.grid[line..line + cols].fill(' '),
-                _ => {}
-            },
+            (None, b'J') => {
+                self.touch(if p(0) == 0 { self.row } else { 0 });
+                match p(0) {
+                    0 => self.grid[cur..].fill(' '),
+                    1 => self.grid[..=cur].fill(' '),
+                    2 | 3 => self.grid.fill(' '),
+                    _ => {}
+                }
+            }
+            (None, b'K') => {
+                self.touch(self.row);
+                match p(0) {
+                    0 => self.grid[cur..line + cols].fill(' '),
+                    1 => self.grid[line..=cur].fill(' '),
+                    2 => self.grid[line..line + cols].fill(' '),
+                    _ => {}
+                }
+            }
             (None, b'L' | b'M') => {
                 if (self.top..=self.bot).contains(&self.row) {
                     if f == b'L' {
@@ -1572,7 +1822,11 @@ impl Term {
     }
 
     fn down(&mut self, n: usize) {
-        let max = if self.row <= self.bot { self.bot } else { self.rows - 1 };
+        let max = if self.row <= self.bot {
+            self.bot
+        } else {
+            self.rows - 1
+        };
         self.row = (self.row + n).min(max);
     }
 
@@ -1601,6 +1855,7 @@ impl Term {
                 let line = self.line(r);
                 self.history.push_back(line);
             }
+            self.scrolled += n as u64;
             while self.history.len() > HISTORY_LINES {
                 self.history.pop_front();
             }
@@ -1645,6 +1900,7 @@ impl Term {
 
     /// Write one cell without leaving half of an overwritten wide character behind.
     fn put(&mut self, col: usize, c: char) {
+        self.touch(self.row);
         let i = self.row * self.cols + col;
         if self.grid[i] == WIDE_TAIL && col > 0 && c != WIDE_TAIL {
             self.grid[i - 1] = ' ';
@@ -1669,16 +1925,27 @@ struct Proc {
 fn procs() -> Vec<Proc> {
     let mut out = Vec::new();
     for entry in fs::read_dir("/proc").into_iter().flatten().flatten() {
-        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
             continue;
         };
-        let Ok(s) = fs::read_to_string(format!("/proc/{pid}/stat")) else { continue };
+        let Ok(s) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
         // comm may contain spaces/parens, so parse after the last ')'
         let Some(close) = s.rfind(')') else { continue };
         let f: Vec<&str> = s[close + 1..].split_whitespace().collect();
         let num = |i: usize| f.get(i).and_then(|v| v.parse::<u64>().ok());
         if let (Some(ppid), Some(sid), Some(u), Some(st)) = (num(1), num(3), num(11), num(12)) {
-            out.push(Proc { pid, ppid: ppid as u32, sid: sid as u32, ticks: u + st });
+            out.push(Proc {
+                pid,
+                ppid: ppid as u32,
+                sid: sid as u32,
+                ticks: u + st,
+            });
         }
     }
     out
@@ -1775,7 +2042,10 @@ mod tests {
     fn insert_delete_chars_and_lines() {
         assert_eq!(term(1, 6, "abcdef\x1b[1;2H\x1b[2P").contents(), "adef");
         assert_eq!(term(1, 6, "abcd\x1b[1;2H\x1b[2@").contents(), "a  bcd");
-        assert_eq!(term(3, 3, "a\r\nb\r\nc\x1b[1;1H\x1b[L").contents(), "\na\nb");
+        assert_eq!(
+            term(3, 3, "a\r\nb\r\nc\x1b[1;1H\x1b[L").contents(),
+            "\na\nb"
+        );
         assert_eq!(term(3, 3, "a\r\nb\r\nc\x1b[1;1H\x1b[M").contents(), "b\nc");
     }
 
@@ -1803,7 +2073,10 @@ mod tests {
 
     #[test]
     fn osc_and_colors_are_invisible() {
-        assert_eq!(term(1, 10, "\x1b]0;title\x07\x1b[1;31mred\x1b[0m").contents(), "red");
+        assert_eq!(
+            term(1, 10, "\x1b]0;title\x07\x1b[1;31mred\x1b[0m").contents(),
+            "red"
+        );
         assert_eq!(term(1, 10, "\x1b]8;;http://x\x1b\\link").contents(), "link");
     }
 
@@ -1860,10 +2133,46 @@ mod tests {
             seed
         };
         let pieces: &[&[u8]] = &[
-            b"\x1b[", b"\x1b[?", b"\x1b]", b"\x1bP", b"\x1b", b";", b"9999999999999999999999",
-            b"0", b"1", b"65535", b"\x07", b"\r", b"\n", b"\t", b"\x08", "日".as_bytes(), b"\xf0\x9f",
-            b"\xff", b"A", b"H", b"J", b"K", b"L", b"M", b"P", b"@", b"X", b"S", b"T", b"r",
-            b"h", b"l", b"1049", b"n", b"c", b"\x1b7", b"\x1b8", b"\x1bM", b"\x1bc", b"x",
+            b"\x1b[",
+            b"\x1b[?",
+            b"\x1b]",
+            b"\x1bP",
+            b"\x1b",
+            b";",
+            b"9999999999999999999999",
+            b"0",
+            b"1",
+            b"65535",
+            b"\x07",
+            b"\r",
+            b"\n",
+            b"\t",
+            b"\x08",
+            "日".as_bytes(),
+            b"\xf0\x9f",
+            b"\xff",
+            b"A",
+            b"H",
+            b"J",
+            b"K",
+            b"L",
+            b"M",
+            b"P",
+            b"@",
+            b"X",
+            b"S",
+            b"T",
+            b"r",
+            b"h",
+            b"l",
+            b"1049",
+            b"n",
+            b"c",
+            b"\x1b7",
+            b"\x1b8",
+            b"\x1bM",
+            b"\x1bc",
+            b"x",
         ];
         for round in 0..300 {
             let mut t = Term::new(1 + (next() % 30) as usize, 1 + (next() % 30) as usize);

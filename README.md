@@ -4,7 +4,7 @@
 
 ### The zero-dependency terminal multiplexer for programs, scripts and AI agents
 
-`0 dependencies` · `1 Rust file` · `565 KiB binary` · `89 tests` · `Linux` · `MIT`
+`0 dependencies` · `1 Rust file` · `590 KiB binary` · `100 tests` · `Linux` · `MIT`
 
 </div>
 
@@ -16,7 +16,7 @@
 >
 > **Zero dependency.** It's built from the Rust standard library and nothing else. `Cargo.lock` lists exactly one package: xumux itself. There's no third-party crate, no C library beyond the libc that std already links, no build script and no code generation. The terminal emulator, PTY handling, protocol and process monitoring are all written here, in one file you can read in an afternoon.
 >
-> **Fully local.** There's no network code at all. xumux talks over a Unix socket that only your user can open, in a directory only your user can enter, and it checks the uid of every connecting process with `SO_PEERCRED`. It never phones home, never downloads anything, and builds offline.
+> **Fully local.** There's no network code at all. xumux talks over a Unix socket that only your user can open, in a directory that must be yours alone (mode `700`, not a symlink) or it refuses to run. It never phones home, never downloads anything, and builds offline.
 >
 > **Open source.** MIT licensed. Everything that runs is in this repository: no binary blobs, no vendored code, no supply chain to trust.
 
@@ -26,13 +26,13 @@
 
 |                         | **xumux**                                     | tmux                                     |
 |-------------------------|-----------------------------------------------|------------------------------------------|
-| Source                  | **1,745 lines**, 1 file                       | 114,498 lines, 157 files                 |
+| Source                  | **2,012 lines**, 1 file                       | 114,498 lines, 157 files                 |
 | Dependencies            | **none**                                      | libevent, ncurses (+ utf8proc, jemalloc) |
-| Binary                  | **565 KiB**, statically linked Rust           | plus shared libraries                    |
+| Binary                  | **590 KiB**, statically linked Rust           | plus shared libraries                    |
 | Clean build             | **4.8 s**, offline                            | autotools + library headers              |
 | Idle daemon memory      | **2.5 MiB**                                   |                                          |
 | Built for               | programs and agents (people via `attach`)     | people at a keyboard                     |
-| Memory safety           | Rust; `unsafe` only in 11 syscall wrappers    | C                                        |
+| Memory safety           | Rust; `#![deny(unsafe_code)]`, 7 libc calls   | C                                        |
 
 <sub>Total lines of source, including comments and blanks; xumux's count leaves out its tests. tmux counted at commit `a73616d` (2026-10-30).</sub>
 
@@ -44,12 +44,15 @@ cargo build --release                  # downloads nothing
 install -m 755 target/release/xumux ~/.local/bin/
 
 xumux serve &                          # the daemon
+xumux spawn sh bash                    # a shell that persists between calls
+xumux run sh 30000 'cd ~/api && ls'    # type, wait until done, print only the new output
 xumux spawn api 'cd ~/api && PORT=8080 exec ./server'
-xumux wait api 10000 'listening'       # block until it's up
-xumux screen api                       # what's on its screen right now
+xumux wait api 10000 'listening || Error'   # block until either text shows up
 xumux stats api                        # CPU and memory of its process tree
 xumux attach api                       # take the keyboard; Ctrl-] detaches
 ```
+
+**Using it from an AI agent?** Read [`AGENTS.md`](AGENTS.md), or run `xumux guide`: the same text is built into the binary.
 
 ## Commands
 
@@ -63,7 +66,11 @@ xumux attach api                       # take the keyboard; Ctrl-] detaches
 | `keys NAME KEY...` | `Enter Tab Esc BSpace Up Down Left Right Home End PgUp PgDn F1`–`F12 C-x M-x`, or plain text | `send-keys` |
 | `screen NAME` | the visible screen as plain text | `capture-pane -p` |
 | `history NAME [LINES]` | scrollback + screen (keeps 10,000 lines) | `capture-pane -p -S -` |
-| `wait NAME MS TEXT` | block until `TEXT` is on screen | *none (scripts poll)* |
+| `run NAME MS TEXT` | type `TEXT` + Enter, wait until the command is done, print only the new output | *none* |
+| `settle NAME [MS] [IDLE]` | wait until output stops and no foreground job is running | *none* |
+| `wait NAME MS TEXT [\|\| TEXT]` | block until any of the texts is on screen; print which | *none (scripts poll)* |
+| `wait-exit NAME MS` | wait for the program to exit; print `exited(N)` | `wait-for` |
+| `guide` | print the agent guide | *none* |
 | `log NAME PATH\|off` | append raw output to a file | `pipe-pane` |
 | `stats NAME` | CPU % and RSS of the whole process tree | *none* |
 | `attach NAME` | interactive; `Ctrl-]` detaches; any number of viewers | `attach` |
@@ -82,19 +89,19 @@ Intel Core i5-14500 (20 threads), Linux 6.14, Rust 1.97, release build. Latencie
 
 | Benchmark | Result |
 |---|---|
-| Daemon start → accepting connections | **2.5 ms** |
-| Idle daemon memory (RSS) | **2.5 MiB** |
-| `list` round trip | **220 µs** median · 359 µs p99 |
-| `send` round trip | **217 µs** median · 328 µs p99 |
-| `info` round trip | **224 µs** median · 363 µs p99 |
-| `screen` round trip (full 40×120 screen) | **309 µs** median · 445 µs p99 |
-| `xumux list` from a shell (process start + request) | **3.2 ms** median |
-| Throughput, 16 concurrent clients | **15,700 requests/s** |
-| `spawn` (PTY + `posix_spawn`), with 200 sessions open | **1.6 ms** median · 18.9 ms p99 |
+| Daemon start → accepting connections | **2.7 ms** |
+| Idle daemon memory (RSS) | **2.6 MiB** |
+| `list` round trip | **218 µs** median · 365 µs p99 |
+| `send` round trip | **213 µs** median · 329 µs p99 |
+| `info` round trip | **282 µs** median · 428 µs p99 |
+| `screen` round trip (full 40×120 screen) | **299 µs** median · 445 µs p99 |
+| `xumux list` from a shell (process start + request) | **3.4 ms** median |
+| Throughput, 16 concurrent clients | **17,700 requests/s** |
+| `spawn` (PTY + `posix_spawn`), with 200 sessions open | **1.7 ms** median · 20.6 ms p99 |
 | Spawn → first output seen by `wait` | **12 ms** median |
 | Daemon with 250 sessions open | **26.9 MiB** RSS · 2 threads per running session |
-| `kill` (whole process tree, reaped) | **18 ms** median |
-| Output throughput, PTY → emulator (200 MiB) | **68–77 MiB/s** |
+| `kill` (whole process tree, reaped) | **19 ms** median |
+| Output throughput, PTY → emulator (200 MiB) | **75 MiB/s** |
 
 Reproduce with:
 
@@ -113,8 +120,7 @@ The threat model has two parts: other users on the same machine, and hostile pro
 
 **Guarantees, each tested in [`tests/security.rs`](tests/security.rs):**
 
-- **Private socket.** The socket is mode `0600`. Its directory must be a real directory (not a symlink) that you own, with mode `700`, or xumux refuses to run. That stops anyone from pre-creating or swapping the socket. Without `$XDG_RUNTIME_DIR` it uses `/tmp/xumux-$UID`, created with mode `0700`.
-- **Peer check.** Every connection's uid is verified with `SO_PEERCRED`, on top of the file permissions.
+- **Private socket.** The socket is mode `0600`. Its directory, including one you pick with `$XUMUX_SOCK`, must be a real directory (not a symlink) that you own with mode `700`, or xumux refuses to run. That's what keeps other users out, and stops anyone from pre-creating or swapping the socket. Without `$XDG_RUNTIME_DIR` it uses `/tmp/xumux-$UID`, created with mode `0700`.
 - **Bounded protocol.** Requests are capped at 1 MiB, must be UTF-8, and must arrive within 5 s in total, so sending one byte at a time doesn't help. Idle connections can't pin threads, and error replies always reach the client.
 - **No fd leaks.** Every descriptor is close-on-exec. A program sees exactly stdin, stdout and stderr on its own PTY: never another session's terminal, the socket, or a log file.
 - **Real isolation per session.** Each program leads its own session with its own controlling terminal. `kill` takes down its descendants, plus orphans that were reparented away but kept the session id.
@@ -122,11 +128,11 @@ The threat model has two parts: other users on the same machine, and hostile pro
 - **Hostile programs can't stall xumux.** Query floods, output floods, raw `/dev/urandom`, unread input and stalled viewers are all tested. Pending input is capped at 4 MiB per session.
 - **Safe logging.** `log` opens only regular files, non-blocking, with mode `0600`. A FIFO with no reader fails right away instead of hanging the session.
 
-**Found and fixed during the audit:** 18 issues, 13 of them security-relevant. They include a reply-flood deadlock in raw mode, a writer thread leaked when a program stopped reading, slow-loris requests, a `/tmp` socket hijack, a group-writable socket window under `umask 002`, unbounded queued input, escape injection through `screen`, stalled viewers slowing a session, and `log` hanging on a FIFO. Each one now has a regression test.
+**Found and fixed during the audit:** 20 issues, 13 of them security-relevant. They include a reply-flood deadlock in raw mode, a writer thread leaked when a program stopped reading, slow-loris requests, a `/tmp` socket hijack, a group-writable socket window under `umask 002`, unbounded queued input, escape injection through `screen`, stalled viewers slowing a session, and `log` hanging on a FIFO. Each one now has a regression test.
 
 ## Zero dependencies, in detail
 
-`unsafe` exists only in the `sys` module: 11 small wrappers around 10 libc functions that std already links (`ioctl`, `setsid`, `getuid`, `kill`, `getsockopt`, `fcntl`, `poll`, `tcgetattr`, `tcsetattr`, `cfmakeraw`). Each has a `SAFETY` comment. `kill` refuses pid 0, pid 1 and anything that would become negative, because those values target whole process groups. Everything else is safe Rust:
+The crate is built with `#![deny(unsafe_code)]`. The one exemption is the `sys` module, where 11 single-call `unsafe` blocks wrap the 7 libc functions std has no safe API for: `ioctl` (PTY unlock, window size, controlling terminal), `setsid`, `kill`, `poll`, and `tcgetattr`/`tcsetattr`/`cfmakeraw` for `attach`'s raw mode. Clippy enforces one call per block and a `SAFETY` comment on each. Anything that *can* be done without a syscall is: the uid is read from `/proc/self/status`, the PTY number from `/proc/self/fdinfo`, and non-blocking mode is set through `OpenOptions`. `kill` refuses pid 0, pid 1 and anything that would become negative, because those values target whole process groups. Everything else is safe Rust:
 
 - **PTYs** are opened through `/dev/ptmx` with std's `OpenOptions`, and processes are managed with std's `Command`/`Child`.
 - **The terminal emulator** handles cursor movement, erase, insert/delete, scroll regions, the alternate screen, UTF-8 and double-width characters, window titles, 10,000 lines of scrollback, and answers cursor-position and device-attribute queries. It has unit tests and a randomized stress test, because a panic would take the daemon down.
@@ -136,15 +142,15 @@ The cost is that this code is ours to maintain instead of borrowed. That's the t
 ## Tests
 
 ```sh
-cargo test --release          # 89 tests: unit, security, commands, swarm
+cargo test --release          # 100 tests: unit, security, commands, swarm
 cargo test                    # the same in debug, with overflow checks
 ```
 
 | Suite | Tests | Covers |
 |---|---|---|
 | unit (`src/main.rs`) | 14 | emulator behavior, sanitizing, name rules, ~900,000-input stress test |
-| [`security.rs`](tests/security.rs) | 30 | socket and directory checks, protocol abuse, isolation, hostile programs |
-| [`commands.rs`](tests/commands.rs) | 37 | every command and its errors, through the socket and the real CLI |
+| [`security.rs`](tests/security.rs) | 31 | socket and directory checks, protocol abuse, isolation, hostile programs |
+| [`commands.rs`](tests/commands.rs) | 47 | every command and its errors, through the socket and the real CLI; `run`/`settle`/`wait-exit` on shells, a REPL and a TUI |
 | [`swarm.rs`](tests/swarm.rs) | 8 | 200 concurrent sessions, 32 clients × 250 mixed commands, 300 spawn/kill cycles with leak checks, parallel floods, 20 viewers, resize storms |
 
 Each test runs its own daemon on its own private socket.

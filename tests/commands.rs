@@ -77,7 +77,10 @@ fn spawn_list_info() {
 fn spawn_errors() {
     let d = Daemon::start();
     d.bash("dup");
-    assert!(d.err(&format!("spawn dup {BASH}")).contains("already exists"));
+    assert!(
+        d.err(&format!("spawn dup {BASH}"))
+            .contains("already exists")
+    );
     assert!(d.err("spawn").contains("usage"));
     assert!(d.err("spawn lonely").contains("usage"));
     assert!(d.err("spawn x    ").contains("usage"));
@@ -87,7 +90,9 @@ fn spawn_errors() {
 fn spawn_command_not_found_reports_exit_127() {
     let d = Daemon::start();
     d.ok("spawn nope definitely-not-a-real-command-xyz");
-    wait_until("exit", Duration::from_secs(5), || d.ok("list").contains("exited(127)"));
+    wait_until("exit", Duration::from_secs(5), || {
+        d.ok("list").contains("exited(127)")
+    });
     assert!(d.screen("nope").contains("not found"));
 }
 
@@ -100,12 +105,22 @@ fn exit_codes_and_signals_are_reported() {
     unsafe_free_kill(pid, "TERM");
     wait_until("statuses", Duration::from_secs(5), || {
         let l = d.ok("list");
-        l.contains("seven\t") && l.contains("exited(7)") && l.contains("exited(0)") && l.contains("killed(sig 15)")
+        l.contains("seven\t")
+            && l.contains("exited(7)")
+            && l.contains("exited(0)")
+            && l.contains("killed(sig 15)")
     });
 }
 
 fn unsafe_free_kill(pid: u32, sig: &str) {
-    assert!(Command::new("kill").arg(format!("-{sig}")).arg(pid.to_string()).status().unwrap().success());
+    assert!(
+        Command::new("kill")
+            .arg(format!("-{sig}"))
+            .arg(pid.to_string())
+            .status()
+            .unwrap()
+            .success()
+    );
 }
 
 #[test]
@@ -113,11 +128,17 @@ fn spawn_working_dir_and_environment() {
     let d = Daemon::start();
     let dir = d.dir.join("work");
     fs::create_dir(&dir).unwrap();
-    d.ok(&format!("spawn env sh -c 'cd {} && export FOO=bar && echo cwd=$(pwd) foo=$FOO term=$TERM; sleep 5'", dir.display()));
+    d.ok(&format!(
+        "spawn env sh -c 'cd {} && export FOO=bar && echo cwd=$(pwd) foo=$FOO term=$TERM; sleep 5'",
+        dir.display()
+    ));
     d.wait("env", "term=");
     let s = d.screen("env");
     assert!(s.contains(&format!("cwd={}", dir.display())), "{s}");
-    assert!(s.contains("foo=bar") && s.contains("term=xterm-256color"), "{s}");
+    assert!(
+        s.contains("foo=bar") && s.contains("term=xterm-256color"),
+        "{s}"
+    );
     // default cwd is $HOME
     d.ok("spawn home pwd");
     d.wait("home", "/");
@@ -154,7 +175,9 @@ fn kill_and_reuse_name() {
 fn kill_already_exited_session() {
     let d = Daemon::start();
     d.ok("spawn quick true");
-    wait_until("exit", Duration::from_secs(5), || d.ok("list").contains("exited(0)"));
+    wait_until("exit", Duration::from_secs(5), || {
+        d.ok("list").contains("exited(0)")
+    });
     d.ok("kill quick");
     assert_eq!(d.ok("list"), "");
 }
@@ -207,7 +230,9 @@ fn keys_arrows_recall_history() {
     d.ok("keys s echo $((300+33)) Enter");
     d.wait("s", "333");
     d.ok("keys s Up Enter");
-    wait_until("second 333", Duration::from_secs(5), || lines_equal(&d.screen("s"), "333") == 2);
+    wait_until("second 333", Duration::from_secs(5), || {
+        lines_equal(&d.screen("s"), "333") == 2
+    });
 }
 
 #[test]
@@ -219,7 +244,9 @@ fn keys_backspace_left_and_ctrl_a() {
     d.wait("s", "123");
     // Ctrl-A jumps to line start: type "cho 9", C-a, "e" -> "echo 9"
     d.ok("keys s cho $((9*1)) C-a e Enter");
-    wait_until("9", Duration::from_secs(5), || lines_equal(&d.screen("s"), "9") == 1);
+    wait_until("9", Duration::from_secs(5), || {
+        lines_equal(&d.screen("s"), "9") == 1
+    });
 }
 
 #[test]
@@ -232,7 +259,10 @@ fn keys_meta_and_function_keys_are_encoded() {
     d.ok("keys raw z"); // 16th byte
     d.wait("raw", "7a");
     let s = d.screen("raw").replace('\n', " ");
-    assert!(s.contains("1b 78 1b 4f 50 1b 5b 31 35 7e 1b 5b 48 00 09 7a"), "{s}");
+    assert!(
+        s.contains("1b 78 1b 4f 50 1b 5b 31 35 7e 1b 5b 48 00 09 7a"),
+        "{s}"
+    );
 }
 
 // ------------------------------------------------------------ output: screen / history / wait / log
@@ -258,7 +288,11 @@ fn history_is_capped() {
     d.ok("send s seq 1 15000; echo SEQ-$((1+1))\\r");
     d.ok("wait s 30000 SEQ-2");
     assert_eq!(d.info("s", "history"), "10000");
-    let first: u32 = d.ok("history s").lines().find_map(|l| l.parse().ok()).unwrap();
+    let first: u32 = d
+        .ok("history s")
+        .lines()
+        .find_map(|l| l.parse().ok())
+        .unwrap();
     assert!(first > 4000, "oldest kept line {first}");
 }
 
@@ -268,7 +302,10 @@ fn alt_screen_programs_do_not_pollute_history() {
     d.bash("s");
     d.ok(r"send s printf '\\033[?1049h'; seq 1 300; printf '\\033[?1049l'; echo ALT-$((1+1))\r");
     d.wait("s", "ALT-2");
-    assert!(!d.ok("history s").lines().any(|l| l == "150"), "alt-screen output leaked into history");
+    assert!(
+        !d.ok("history s").lines().any(|l| l == "150"),
+        "alt-screen output leaked into history"
+    );
 }
 
 #[test]
@@ -295,9 +332,13 @@ fn log_captures_raw_output_and_can_stop() {
     d.ok(&format!("log s {}", path.display()));
     assert_eq!(d.info("s", "log"), path.display().to_string());
     d.ok(r"send s printf '\\033[1;31m%s\\033[0m\\n' RED\r");
-    wait_until("red", Duration::from_secs(5), || lines_equal(&d.screen("s"), "RED") == 1);
+    wait_until("red", Duration::from_secs(5), || {
+        lines_equal(&d.screen("s"), "RED") == 1
+    });
     wait_until("log written", Duration::from_secs(5), || {
-        fs::read(&path).map(|b| b.windows(10).any(|w| w == b"\x1b[1;31mRED")).unwrap_or(false)
+        fs::read(&path)
+            .map(|b| b.windows(10).any(|w| w == b"\x1b[1;31mRED"))
+            .unwrap_or(false)
     });
     d.ok("log s off");
     assert_eq!(d.info("s", "log"), "-");
@@ -306,7 +347,10 @@ fn log_captures_raw_output_and_can_stop() {
     d.wait("s", "AFTER-2");
     thread::sleep(Duration::from_millis(100));
     assert_eq!(fs::metadata(&path).unwrap().len(), size);
-    assert!(d.err("log s /nonexistent-dir/x.log").contains("No such file"));
+    assert!(
+        d.err("log s /nonexistent-dir/x.log")
+            .contains("No such file")
+    );
 }
 
 #[test]
@@ -320,7 +364,10 @@ fn cli_log_resolves_relative_paths() {
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
-    assert_eq!(d.info("s", "log"), d.dir.join("rel.log").display().to_string());
+    assert_eq!(
+        d.info("s", "log"),
+        d.dir.join("rel.log").display().to_string()
+    );
 }
 
 #[test]
@@ -328,7 +375,9 @@ fn title_and_alt_screen_in_info() {
     let d = Daemon::start();
     d.bash("s");
     d.ok(r"send s printf '\\033]2;build: 42%%\\007\\033[?1049h'; sleep 30\r");
-    wait_until("alt", Duration::from_secs(5), || d.info("s", "alt_screen") == "yes");
+    wait_until("alt", Duration::from_secs(5), || {
+        d.info("s", "alt_screen") == "yes"
+    });
     assert_eq!(d.info("s", "title"), "build: 42%");
 }
 
@@ -337,7 +386,9 @@ fn unicode_round_trip() {
     let d = Daemon::start();
     d.bash("s");
     d.ok("send s echo 'héllo 日本語 🚀 ok'\\r");
-    wait_until("unicode", Duration::from_secs(5), || lines_equal(&d.screen("s"), "héllo 日本語 🚀 ok") == 1);
+    wait_until("unicode", Duration::from_secs(5), || {
+        lines_equal(&d.screen("s"), "héllo 日本語 🚀 ok") == 1
+    });
 }
 
 // ------------------------------------------------------------ terminal: resize / stats / TUI
@@ -359,12 +410,18 @@ fn full_screen_tui_and_resize_redraw() {
     d.ok("spawn top top -d 0.2");
     d.wait("top", "load average");
     d.ok("resize top 15 100");
-    wait_until("top redraws at the new size", Duration::from_secs(5), || {
-        let s = d.screen("top");
-        s.lines().count() <= 15 && s.contains("load average")
-    });
+    wait_until(
+        "top redraws at the new size",
+        Duration::from_secs(5),
+        || {
+            let s = d.screen("top");
+            s.lines().count() <= 15 && s.contains("load average")
+        },
+    );
     d.ok("keys top q");
-    wait_until("top quit", Duration::from_secs(5), || d.ok("list").contains("exited(0)"));
+    wait_until("top quit", Duration::from_secs(5), || {
+        d.ok("list").contains("exited(0)")
+    });
 }
 
 #[test]
@@ -373,7 +430,12 @@ fn stats_measures_cpu_and_memory() {
     d.ok("spawn burn sh -c 'while :; do :; done'");
     thread::sleep(Duration::from_millis(200));
     let body = d.ok("stats burn");
-    let get = |k: &str| body.lines().find_map(|l| l.strip_prefix(&format!("{k}\t"))).unwrap().to_string();
+    let get = |k: &str| {
+        body.lines()
+            .find_map(|l| l.strip_prefix(&format!("{k}\t")))
+            .unwrap()
+            .to_string()
+    };
     let cpu: f64 = get("cpu").trim_end_matches('%').parse().unwrap();
     assert!(cpu > 50.0, "{body}");
     assert!(get("rss").ends_with("MiB"));
@@ -387,7 +449,9 @@ fn stats_measures_cpu_and_memory() {
 fn stats_counts_the_whole_tree() {
     let d = Daemon::start();
     d.ok("spawn tree sh -c 'sleep 30 & sleep 30 & sleep 30 & wait'");
-    wait_until("children", Duration::from_secs(5), || d.ok("stats tree").contains("procs\t4"));
+    wait_until("children", Duration::from_secs(5), || {
+        d.ok("stats tree").contains("procs\t4")
+    });
 }
 
 // ------------------------------------------------------------ attach
@@ -415,17 +479,28 @@ fn attach_types_sees_output_and_detaches() {
     d.ok("send s echo BEFORE-$((1+1))\\r");
     d.wait("s", "BEFORE-2");
     let mut c = attach(&d, "s");
-    wait_until("attached", Duration::from_secs(5), || d.info("s", "attached") == "1");
-    c.stdin.as_mut().unwrap().write_all(b"echo $((7*111))\r").unwrap();
+    wait_until("attached", Duration::from_secs(5), || {
+        d.info("s", "attached") == "1"
+    });
+    c.stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"echo $((7*111))\r")
+        .unwrap();
     d.wait("s", "777");
     c.stdin.as_mut().unwrap().write_all(&[0x1d]).unwrap(); // Ctrl-]
     let out = collect(c);
     assert!(out.contains("BEFORE-2"), "initial redraw missing: {out:?}");
     assert!(out.contains("777"), "live output missing: {out:?}");
     assert!(out.contains("[xumux: detached]"));
-    wait_until("detached", Duration::from_secs(5), || d.info("s", "attached") == "0");
+    wait_until("detached", Duration::from_secs(5), || {
+        d.info("s", "attached") == "0"
+    });
     d.alive();
-    assert!(d.ok("list").contains("running"), "detaching must not kill the session");
+    assert!(
+        d.ok("list").contains("running"),
+        "detaching must not kill the session"
+    );
 }
 
 #[test]
@@ -433,7 +508,9 @@ fn attach_many_clients_see_the_same_output() {
     let d = Daemon::start();
     d.bash("s");
     let clients: Vec<_> = (0..10).map(|_| attach(&d, "s")).collect();
-    wait_until("10 attached", Duration::from_secs(5), || d.info("s", "attached") == "10");
+    wait_until("10 attached", Duration::from_secs(5), || {
+        d.info("s", "attached") == "10"
+    });
     d.ok("send s echo BROADCAST-$((1000+1))\\r");
     d.wait("s", "BROADCAST-1001");
     thread::sleep(Duration::from_millis(200));
@@ -459,7 +536,11 @@ fn attach_with_piped_input_keeps_streaming_until_exit() {
     let d = Daemon::start();
     d.bash("s");
     let mut c = attach(&d, "s");
-    c.stdin.take().unwrap().write_all(b"echo PIPED-$((2+3)); sleep 0.3; exit\r").unwrap(); // stdin closes
+    c.stdin
+        .take()
+        .unwrap()
+        .write_all(b"echo PIPED-$((2+3)); sleep 0.3; exit\r")
+        .unwrap(); // stdin closes
     let out = collect(c);
     assert!(out.contains("PIPED-5"), "{out:?}");
 }
@@ -480,7 +561,8 @@ fn attach_over_raw_socket_resizes_and_streams() {
     d.bash("s");
     let mut sock = UnixStream::connect(&d.sock).unwrap();
     // keystrokes in the same packet as the request must not be lost
-    sock.write_all(b"attach s 30 90\necho $((123+321))\r").unwrap();
+    sock.write_all(b"attach s 30 90\necho $((123+321))\r")
+        .unwrap();
     d.wait("s", "444");
     assert_eq!(d.info("s", "size"), "30x90");
     sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -497,6 +579,150 @@ fn shutdown_kills_everything_and_removes_socket() {
     let pids: Vec<u32> = (0..5).map(|i| d.bash(&format!("s{i}"))).collect();
     let body = d.ok("shutdown");
     assert_eq!(body, "killed 5 sessions\n");
-    wait_until("all dead", Duration::from_secs(5), || pids.iter().all(|&p| !proc_alive(p)));
+    wait_until("all dead", Duration::from_secs(5), || {
+        pids.iter().all(|&p| !proc_alive(p))
+    });
     wait_until("socket gone", Duration::from_secs(5), || !d.sock.exists());
+}
+
+// ------------------------------------------------------------ agent commands
+
+#[test]
+fn run_returns_only_new_output_and_keeps_state() {
+    let d = Daemon::start();
+    d.bash("s");
+    d.ok("send s seq 1 100\\r"); // old output that must not come back
+    d.wait("s", "100");
+    d.ok("settle s");
+    let out = d.ok("run s 5000 cd / && echo here-$((2*21))");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines[0], "$ cd / && echo here-$((2*21))", "{out}");
+    assert_eq!(lines[1], "here-42");
+    assert_eq!(lines.last(), Some(&"[xumux] quiet"));
+    assert!(!out.contains("\n50\n"), "old output leaked into run: {out}");
+    let out = d.ok("run s 5000 pwd");
+    assert!(out.lines().any(|l| l == "/"), "cd did not persist: {out}");
+}
+
+#[test]
+fn run_waits_for_silent_commands_in_a_shell() {
+    let d = Daemon::start();
+    d.bash("s");
+    let t = Instant::now();
+    let out = d.ok("run s 10000 sleep 1; echo woke-$((1+1))");
+    assert!(
+        t.elapsed() >= Duration::from_secs(1),
+        "returned while sleep was running"
+    );
+    assert!(
+        out.contains("\nwoke-2\n") && out.ends_with("[xumux] quiet\n"),
+        "{out}"
+    );
+}
+
+#[test]
+fn run_timeout_names_the_running_command() {
+    let d = Daemon::start();
+    d.bash("s");
+    let out = d.ok("run s 400 sleep 30");
+    assert!(
+        out.ends_with("[xumux] timeout: sleep still running\n"),
+        "{out}"
+    );
+    assert!(d.info("s", "foreground").starts_with("sleep ("));
+    d.ok("keys s C-c");
+    assert_eq!(d.ok("settle s 5000"), "quiet\n");
+    assert_eq!(d.info("s", "foreground"), "-");
+}
+
+#[test]
+fn run_reports_program_exit() {
+    let d = Daemon::start();
+    d.bash("s");
+    let out = d.ok("run s 5000 exit 3");
+    assert!(out.ends_with("[xumux] exited(3)\n"), "{out}");
+}
+
+#[test]
+fn run_in_a_repl_and_full_screen_programs() {
+    let d = Daemon::start();
+    d.ok("spawn py python3 -q");
+    d.ok("settle py 10000");
+    let out = d.ok("run py 5000 6*7");
+    assert!(out.lines().any(|l| l == "42"), "{out}");
+    d.ok("spawn top top -d 0.5");
+    d.wait("top", "load average");
+    let out = d.ok("run top 3000 ");
+    assert!(
+        out.contains("load average") && out.lines().count() > 10,
+        "full screen expected: {out}"
+    );
+}
+
+#[test]
+fn run_handles_scrolling_past_the_screen() {
+    let d = Daemon::start();
+    d.bash("s");
+    let out = d.ok("run s 10000 seq 1 300");
+    let nums: Vec<u32> = out.lines().filter_map(|l| l.parse().ok()).collect();
+    assert_eq!(nums, (1..=300).collect::<Vec<_>>());
+}
+
+#[test]
+fn settle_waits_for_output_to_stop() {
+    let d = Daemon::start();
+    d.ok("spawn ticker sh -c 'for i in 1 2 3 4 5; do echo tick$i; sleep 0.1; done; sleep 30'");
+    assert_eq!(d.ok("settle ticker 5000"), "quiet\n");
+    assert!(d.screen("ticker").contains("tick5"));
+    d.ok("spawn noisy sh -c 'while :; do echo x; sleep 0.05; done'");
+    assert_eq!(d.ok("settle noisy 400"), "timeout\n");
+    assert!(d.err("settle noisy abc").contains("usage"));
+}
+
+#[test]
+fn wait_alternatives_report_the_match() {
+    let d = Daemon::start();
+    d.bash("s");
+    d.ok("send s echo build-$((0+1))-failed\\r");
+    assert_eq!(
+        d.ok("wait s 5000 ok-1 || build-1-failed || other"),
+        "build-1-failed\n"
+    );
+    assert!(d.err("wait s 200 nope || never").contains("timed out"));
+}
+
+#[test]
+fn wait_exit_reports_code_signal_and_timeout() {
+    let d = Daemon::start();
+    d.ok("spawn a sh -c 'sleep 0.2; exit 9'");
+    assert_eq!(d.ok("wait-exit a 5000"), "exited(9)\n");
+    let pid: u32 = d.ok("spawn b sleep 30").trim().parse().unwrap();
+    assert!(d.err("wait-exit b 200").contains("still running"));
+    assert!(
+        Command::new("kill")
+            .arg("-INT")
+            .arg(pid.to_string())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(d.ok("wait-exit b 5000"), "killed(sig 2)\n");
+    assert!(d.err("wait-exit b").contains("usage"));
+}
+
+#[test]
+fn guide_works_with_and_without_a_daemon() {
+    let out = Command::new(BIN)
+        .arg("guide")
+        .env("XUMUX_SOCK", "/nonexistent/x.sock")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.starts_with("# xumux: guide for AI agents")
+            && text.contains("## 3. Command reference")
+    );
+    let d = Daemon::start();
+    assert_eq!(d.ok("guide"), text);
 }

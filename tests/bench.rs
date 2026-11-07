@@ -22,7 +22,11 @@ fn pct(mut v: Vec<Duration>) -> (Duration, Duration) {
 
 fn us(d: Duration) -> String {
     let us = d.as_secs_f64() * 1e6;
-    if us >= 1000.0 { format!("{:.2} ms", us / 1000.0) } else { format!("{us:.0} µs") }
+    if us >= 1000.0 {
+        format!("{:.2} ms", us / 1000.0)
+    } else {
+        format!("{us:.0} µs")
+    }
 }
 
 fn rss_kib(pid: u32) -> u64 {
@@ -80,11 +84,17 @@ fn bench() {
             e
         })
         .collect();
-    row("Daemon start → accepting connections (median)", us(pct(starts).0));
+    row(
+        "Daemon start → accepting connections (median)",
+        us(pct(starts).0),
+    );
 
     let d = Daemon::start();
     thread::sleep(Duration::from_millis(100));
-    row("Daemon memory, idle (RSS)", format!("{:.1} MiB", rss_kib(d.pid()) as f64 / 1024.0));
+    row(
+        "Daemon memory, idle (RSS)",
+        format!("{:.1} MiB", rss_kib(d.pid()) as f64 / 1024.0),
+    );
 
     // ---- request latency (raw socket, no process spawn)
     d.ok("spawn sh env PS1='$ ' bash --norc --noprofile -i");
@@ -109,7 +119,10 @@ fn bench() {
             t.elapsed()
         })
         .collect();
-    row("`xumux list` from a shell (process start + request)", format!("{} median", us(pct(cli).0)));
+    row(
+        "`xumux list` from a shell (process start + request)",
+        format!("{} median", us(pct(cli).0)),
+    );
 
     // ---- throughput: 16 concurrent clients
     let stop = Arc::new(AtomicBool::new(false));
@@ -134,7 +147,13 @@ fn bench() {
     for w in workers {
         w.join().unwrap();
     }
-    row("Throughput, 16 concurrent clients (`info`)", format!("{:.0} requests/s", count.load(Ordering::Relaxed) as f64 / 3.0));
+    row(
+        "Throughput, 16 concurrent clients (`info`)",
+        format!(
+            "{:.0} requests/s",
+            count.load(Ordering::Relaxed) as f64 / 3.0
+        ),
+    );
 
     // ---- spawn
     let spawns: Vec<Duration> = (0..200)
@@ -145,7 +164,10 @@ fn bench() {
         })
         .collect();
     let (p50, p99) = pct(spawns);
-    row("`spawn` (PTY + posix_spawn), 200 sessions", format!("{} median · {} p99", us(p50), us(p99)));
+    row(
+        "`spawn` (PTY + posix_spawn), 200 sessions",
+        format!("{} median · {} p99", us(p50), us(p99)),
+    );
     let first_output: Vec<Duration> = (0..50)
         .map(|i| {
             let t = Instant::now();
@@ -154,7 +176,10 @@ fn bench() {
             t.elapsed()
         })
         .collect();
-    row("Spawn → first output visible to `wait`", format!("{} median", us(pct(first_output).0)));
+    row(
+        "Spawn → first output visible to `wait`",
+        format!("{} median", us(pct(first_output).0)),
+    );
     thread::sleep(Duration::from_millis(300));
     let rss = rss_kib(d.pid());
     let threads = thread_count(d.pid());
@@ -169,7 +194,10 @@ fn bench() {
             t.elapsed()
         })
         .collect();
-    row("`kill` (whole process tree, reaped)", format!("{} median", us(pct(kills).0)));
+    row(
+        "`kill` (whole process tree, reaped)",
+        format!("{} median", us(pct(kills).0)),
+    );
 
     // ---- emulator throughput
     let mb = 200usize;
@@ -180,9 +208,15 @@ fn bench() {
     let t = Instant::now();
     d.ok("wait flood 120000 FLOOD-END");
     let secs = t.elapsed().as_secs_f64();
-    row("Output throughput through PTY + emulator (200 MiB, 100-col lines)", format!("{:.0} MiB/s", mb as f64 / secs));
+    row(
+        "Output throughput through PTY + emulator (200 MiB, 100-col lines)",
+        format!("{:.0} MiB/s", mb as f64 / secs),
+    );
 
     // ---- binary
     let size = std::fs::metadata(BIN).unwrap().len();
-    row("Binary size (release, stripped)", format!("{:.0} KiB", size as f64 / 1024.0));
+    row(
+        "Binary size (release, stripped)",
+        format!("{:.0} KiB", size as f64 / 1024.0),
+    );
 }

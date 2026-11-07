@@ -6,7 +6,7 @@ use common::*;
 
 use std::io::{Read, Write};
 use std::net::Shutdown;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -23,7 +23,11 @@ fn socket_is_owner_only() {
 #[test]
 fn second_daemon_on_same_socket_is_refused() {
     let d = Daemon::start();
-    let out = Command::new(BIN).arg("serve").env("XUMUX_SOCK", &d.sock).output().unwrap();
+    let out = Command::new(BIN)
+        .arg("serve")
+        .env("XUMUX_SOCK", &d.sock)
+        .output()
+        .unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("already running"));
     d.alive();
@@ -55,9 +59,15 @@ fn cli_with_env(vars: &[(&str, &str)], remove: &[&str]) -> std::process::Output 
 fn world_writable_runtime_dir_is_refused() {
     let dir = private_dir();
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
-    let out = cli_with_env(&[("XDG_RUNTIME_DIR", dir.to_str().unwrap())], &["XUMUX_SOCK"]);
+    let out = cli_with_env(
+        &[("XDG_RUNTIME_DIR", dir.to_str().unwrap())],
+        &["XUMUX_SOCK"],
+    );
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success() && err.contains("refusing") && err.contains("777"), "{err}");
+    assert!(
+        !out.status.success() && err.contains("refusing") && err.contains("777"),
+        "{err}"
+    );
     fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -65,7 +75,10 @@ fn world_writable_runtime_dir_is_refused() {
 fn group_readable_runtime_dir_is_refused() {
     let dir = private_dir();
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o750)).unwrap();
-    let out = cli_with_env(&[("XDG_RUNTIME_DIR", dir.to_str().unwrap())], &["XUMUX_SOCK"]);
+    let out = cli_with_env(
+        &[("XDG_RUNTIME_DIR", dir.to_str().unwrap())],
+        &["XUMUX_SOCK"],
+    );
     assert!(String::from_utf8_lossy(&out.stderr).contains("refusing"));
     fs::remove_dir_all(&dir).unwrap();
 }
@@ -76,7 +89,10 @@ fn symlinked_runtime_dir_is_refused() {
     let link = real.with_extension("link");
     let _ = fs::remove_file(&link);
     symlink(&real, &link).unwrap();
-    let out = cli_with_env(&[("XDG_RUNTIME_DIR", link.to_str().unwrap())], &["XUMUX_SOCK"]);
+    let out = cli_with_env(
+        &[("XDG_RUNTIME_DIR", link.to_str().unwrap())],
+        &["XUMUX_SOCK"],
+    );
     assert!(String::from_utf8_lossy(&out.stderr).contains("symlink"));
     fs::remove_file(&link).unwrap();
     fs::remove_dir_all(&real).unwrap();
@@ -98,7 +114,10 @@ fn tmp_fallback_is_a_private_per_user_dir() {
     let uid = fs::read_to_string("/proc/self/status")
         .unwrap()
         .lines()
-        .find_map(|l| l.strip_prefix("Uid:").map(|v| v.split_whitespace().next().unwrap().to_string()))
+        .find_map(|l| {
+            l.strip_prefix("Uid:")
+                .map(|v| v.split_whitespace().next().unwrap().to_string())
+        })
         .unwrap();
     let dir = std::path::PathBuf::from(format!("/tmp/xumux-{uid}"));
     assert_eq!(mode(&dir), 0o700);
@@ -128,7 +147,10 @@ fn oversized_request_is_rejected_not_executed() {
 #[test]
 fn invalid_utf8_is_rejected() {
     let d = Daemon::start();
-    assert!(d.raw(b"list\xff\xfe\n").starts_with("ERR request is not valid UTF-8"));
+    assert!(
+        d.raw(b"list\xff\xfe\n")
+            .starts_with("ERR request is not valid UTF-8")
+    );
     d.alive();
 }
 
@@ -146,9 +168,20 @@ fn incomplete_request_is_rejected() {
 #[test]
 fn nul_bytes_and_control_chars_are_harmless() {
     let d = Daemon::start();
-    for req in [&b"\0\n"[..], b"list\0\n", b"spawn \0 sh\n", b"\x1b[2J\n", b"kill \x07\n", b"\r\n", b"\n"] {
+    for req in [
+        &b"\0\n"[..],
+        b"list\0\n",
+        b"spawn \0 sh\n",
+        b"\x1b[2J\n",
+        b"kill \x07\n",
+        b"\r\n",
+        b"\n",
+    ] {
         let r = d.raw(req);
-        assert!(r.starts_with("OK\n") || r.starts_with("ERR "), "{req:?} -> {r:?}");
+        assert!(
+            r.starts_with("OK\n") || r.starts_with("ERR "),
+            "{req:?} -> {r:?}"
+        );
     }
     d.alive();
 }
@@ -158,9 +191,36 @@ fn random_garbage_never_kills_the_daemon() {
     let d = Daemon::start();
     d.bash("victim");
     let words = [
-        "spawn", "send", "keys", "screen", "history", "wait", "list", "info", "log", "resize",
-        "rename", "kill", "victim", "0", "-1", "99999999999999999999", "1000", "1001", "\\x", "\\",
-        "\\xZZ", "C-", "M-", "../..", "/etc/passwd", "off", "日本", "\u{202e}", "", " ",
+        "spawn",
+        "send",
+        "keys",
+        "screen",
+        "history",
+        "wait",
+        "list",
+        "info",
+        "log",
+        "resize",
+        "rename",
+        "kill",
+        "victim",
+        "0",
+        "-1",
+        "99999999999999999999",
+        "1000",
+        "1001",
+        "\\x",
+        "\\",
+        "\\xZZ",
+        "C-",
+        "M-",
+        "../..",
+        "/etc/passwd",
+        "off",
+        "日本",
+        "\u{202e}",
+        "",
+        " ",
     ];
     let mut rng = Rng(0xDEADBEEF);
     for _ in 0..1500 {
@@ -174,12 +234,18 @@ fn random_garbage_never_kills_the_daemon() {
             line.push(' ');
         }
         // Never ask for these by accident: they would end the test early.
-        if line.starts_with("shutdown") || line.contains("kill victim") || line.contains("rename victim") {
+        if line.starts_with("shutdown")
+            || line.contains("kill victim")
+            || line.contains("rename victim")
+        {
             continue;
         }
         let line = line.replace('\n', " ");
         let r = d.raw(format!("{line}\n").as_bytes());
-        assert!(r.starts_with("OK\n") || r.starts_with("ERR "), "{line:?} -> {r:?}");
+        assert!(
+            r.starts_with("OK\n") || r.starts_with("ERR "),
+            "{line:?} -> {r:?}"
+        );
     }
     d.alive();
     assert!(d.ok("list").contains("victim\t"));
@@ -188,10 +254,16 @@ fn random_garbage_never_kills_the_daemon() {
 #[test]
 fn idle_connections_time_out_and_do_not_block_others() {
     let d = Daemon::start();
-    let idle: Vec<UnixStream> = (0..200).map(|_| UnixStream::connect(&d.sock).unwrap()).collect();
+    let idle: Vec<UnixStream> = (0..200)
+        .map(|_| UnixStream::connect(&d.sock).unwrap())
+        .collect();
     let t = Instant::now();
     d.alive();
-    assert!(t.elapsed() < Duration::from_secs(1), "list took {:?} behind idle clients", t.elapsed());
+    assert!(
+        t.elapsed() < Duration::from_secs(1),
+        "list took {:?} behind idle clients",
+        t.elapsed()
+    );
     let mut first = &idle[0];
     let mut reply = String::new();
     let t = Instant::now();
@@ -268,13 +340,22 @@ fn no_file_descriptors_leak_into_programs() {
     d.ok("spawn probe ls -l /proc/self/fd");
     d.wait("probe", "total");
     let screen = d.screen("probe");
-    let targets: Vec<&str> = screen.lines().filter_map(|l| l.split(" -> ").nth(1)).collect();
+    let targets: Vec<&str> = screen
+        .lines()
+        .filter_map(|l| l.split(" -> ").nth(1))
+        .collect();
     assert!(!targets.is_empty(), "{screen}");
     for t in &targets {
-        assert!(t.starts_with("/dev/pts/") || t.starts_with("/proc/"), "leaked fd -> {t}\n{screen}");
+        assert!(
+            t.starts_with("/dev/pts/") || t.starts_with("/proc/"),
+            "leaked fd -> {t}\n{screen}"
+        );
     }
     // exactly stdin/stdout/stderr on one pty, plus ls's own directory handle
-    let ptys: Vec<_> = targets.iter().filter(|t| t.starts_with("/dev/pts/")).collect();
+    let ptys: Vec<_> = targets
+        .iter()
+        .filter(|t| t.starts_with("/dev/pts/"))
+        .collect();
     assert_eq!(ptys.len(), 3, "{screen}");
     assert!(ptys.iter().all(|p| p == &ptys[0]));
 }
@@ -290,9 +371,17 @@ fn each_program_gets_its_own_session_and_controlling_tty() {
     }
     let parse = |name: &str| {
         let s = d.screen(name);
-        let line = s.lines().find(|l| l.starts_with("sid=")).unwrap().to_string();
+        let line = s
+            .lines()
+            .find(|l| l.starts_with("sid="))
+            .unwrap()
+            .to_string();
         let f: Vec<&str> = line.split(' ').collect();
-        (f[0][4..].to_string(), f[1][4..].to_string(), f[2][4..].to_string())
+        (
+            f[0][4..].to_string(),
+            f[1][4..].to_string(),
+            f[2][4..].to_string(),
+        )
     };
     let (sid_a, pid_a, tty_a) = parse("a");
     let (_, _, tty_b) = parse("b");
@@ -306,15 +395,21 @@ fn kill_takes_down_background_jobs_and_orphans() {
     let d = Daemon::start();
     d.bash("s");
     d.ok("send s sleep 7771001 & sleep 7771002 & disown -a; nohup sleep 7771003 >/dev/null 2>&1 &\\r");
-    wait_until("sleeps started", Duration::from_secs(15), || pids_matching("sleep 777100").len() == 3);
+    wait_until("sleeps started", Duration::from_secs(15), || {
+        pids_matching("sleep 777100").len() == 3
+    });
     // An orphan: its parent exits immediately, so it is reparented away from
     // the session tree but keeps the session id.
     // nohup: without it the kernel's hangup on session-leader exit kills it first.
     d.ok("spawn orphan sh -c 'nohup sleep 7771004 >/dev/null 2>&1 & sleep 0.2; exit 0'");
-    wait_until("orphan started", Duration::from_secs(15), || !pids_matching("sleep 7771004").is_empty());
+    wait_until("orphan started", Duration::from_secs(15), || {
+        !pids_matching("sleep 7771004").is_empty()
+    });
     d.ok("kill s");
     d.ok("kill orphan");
-    wait_until("all sleeps gone", Duration::from_secs(15), || pids_matching("sleep 777100").is_empty());
+    wait_until("all sleeps gone", Duration::from_secs(15), || {
+        pids_matching("sleep 777100").is_empty()
+    });
 }
 
 #[test]
@@ -340,8 +435,15 @@ fn screen_output_cannot_carry_escape_injection() {
     for text in [d.screen("evil"), d.ok("history evil")] {
         assert!(text.contains("A31mBCDEFG"), "{text:?}");
         for c in text.chars() {
-            assert!(c == '\n' || !c.is_control(), "control char {:?} in {text:?}", c);
-            assert!(!matches!(c as u32, 0x202A..=0x202E | 0x2066..=0x2069), "bidi char in {text:?}");
+            assert!(
+                c == '\n' || !c.is_control(),
+                "control char {:?} in {text:?}",
+                c
+            );
+            assert!(
+                !matches!(c as u32, 0x202A..=0x202E | 0x2066..=0x2069),
+                "bidi char in {text:?}"
+            );
         }
     }
 }
@@ -383,9 +485,15 @@ fn output_flood_keeps_the_daemon_responsive() {
         d.ok("list");
         d.ok("info flood");
         worst = worst.max(t.elapsed());
-        assert!(start.elapsed() < Duration::from_secs(60), "flood never finished");
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "flood never finished"
+        );
     }
-    assert!(worst < Duration::from_millis(250), "worst latency during flood: {worst:?}");
+    assert!(
+        worst < Duration::from_millis(250),
+        "worst latency during flood: {worst:?}"
+    );
 }
 
 #[test]
@@ -403,7 +511,10 @@ fn huge_input_is_bounded() {
         }
         assert!(r.starts_with("OK"), "{r}");
     }
-    assert!(full, "input queue never filled: memory would grow without bound");
+    assert!(
+        full,
+        "input queue never filled: memory would grow without bound"
+    );
     d.alive();
 }
 
@@ -426,11 +537,20 @@ fn log_to_fifo_or_device_is_refused_without_hanging() {
     let d = Daemon::start();
     d.bash("s");
     let fifo = d.dir.join("fifo");
-    assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
     let t = Instant::now();
     let msg = d.err(&format!("log s {}", fifo.display()));
     assert!(t.elapsed() < Duration::from_secs(1), "log open hung");
-    assert!(msg.contains("No such device") || msg.contains("not a regular file"), "{msg}");
+    assert!(
+        msg.contains("No such device") || msg.contains("not a regular file"),
+        "{msg}"
+    );
     assert!(d.err("log s /dev/null").contains("not a regular file"));
     d.ok("send s echo $((5+5))\\r");
     d.wait("s", "10");
@@ -443,13 +563,39 @@ fn stalled_attached_client_cannot_slow_the_session() {
     // Attach over a raw socket and never read a byte.
     let mut stalled = UnixStream::connect(&d.sock).unwrap();
     stalled.write_all(b"attach s 0 0\n").unwrap();
-    wait_until("attached", Duration::from_secs(5), || d.info("s", "attached") == "1");
+    wait_until("attached", Duration::from_secs(5), || {
+        d.info("s", "attached") == "1"
+    });
     let t = Instant::now();
     // ~20 MB: far more than a client may lag behind (1024 chunks), so the
     // stalled client must be dropped rather than buffered without bound.
     d.ok("send s seq 1 3000000; echo DONE-$((1+1))\\r");
     d.ok("wait s 120000 DONE-2");
-    assert!(t.elapsed() < Duration::from_secs(60), "session slowed to {:?}", t.elapsed());
-    wait_until("stalled client dropped", Duration::from_secs(10), || d.info("s", "attached") == "0");
+    assert!(
+        t.elapsed() < Duration::from_secs(60),
+        "session slowed to {:?}",
+        t.elapsed()
+    );
+    wait_until("stalled client dropped", Duration::from_secs(10), || {
+        d.info("s", "attached") == "0"
+    });
     drop(stalled);
+}
+
+#[test]
+fn explicit_socket_path_must_also_be_in_a_private_dir() {
+    // /tmp is world-writable: a socket there could be reached or swapped.
+    for path in ["/tmp/xumux-shared.sock", "/proc/x.sock"] {
+        let out = Command::new(BIN)
+            .arg("serve")
+            .env("XUMUX_SOCK", path)
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("refusing socket dir"),
+            "{path}"
+        );
+    }
+    assert!(!std::path::Path::new("/tmp/xumux-shared.sock").exists());
 }

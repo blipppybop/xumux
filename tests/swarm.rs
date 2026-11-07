@@ -17,7 +17,9 @@ fn two_hundred_sessions_spawned_concurrently() {
             thread::spawn(move || {
                 for i in 0..10 {
                     let n = t * 10 + i;
-                    d.ok(&format!("spawn w{n} sh -c 'echo ready-$((1000+{n})); sleep 120'"));
+                    d.ok(&format!(
+                        "spawn w{n} sh -c 'echo ready-$((1000+{n})); sleep 120'"
+                    ));
                 }
             })
         })
@@ -29,7 +31,11 @@ fn two_hundred_sessions_spawned_concurrently() {
     for n in 0..200 {
         d.wait(&format!("w{n}"), &format!("ready-{}", 1000 + n));
     }
-    let pids: Vec<u32> = d.ok("list").lines().map(|l| l.split('\t').nth(1).unwrap().parse().unwrap()).collect();
+    let pids: Vec<u32> = d
+        .ok("list")
+        .lines()
+        .map(|l| l.split('\t').nth(1).unwrap().parse().unwrap())
+        .collect();
     // kill them all concurrently too
     let handles: Vec<_> = (0..20)
         .map(|t| {
@@ -45,7 +51,9 @@ fn two_hundred_sessions_spawned_concurrently() {
         h.join().unwrap();
     }
     assert_eq!(d.ok("list"), "");
-    wait_until("all 200 dead", Duration::from_secs(10), || pids.iter().all(|&p| !proc_alive(p)));
+    wait_until("all 200 dead", Duration::from_secs(10), || {
+        pids.iter().all(|&p| !proc_alive(p))
+    });
 }
 
 #[test]
@@ -98,10 +106,18 @@ fn mixed_command_storm_from_32_clients() {
         let ok = (0..5).any(|attempt| {
             d.ok(&format!("send s{i} \\x03"));
             thread::sleep(Duration::from_millis(600)); // past readline's keyseq timeout
-            d.ok(&format!("send s{i} echo $(({}+{i}))\\r", 7000 + attempt * 100));
-            d.req(&format!("wait s{i} 3000 {}", 7000 + attempt * 100 + i)).starts_with("OK")
+            d.ok(&format!(
+                "send s{i} echo $(({}+{i}))\\r",
+                7000 + attempt * 100
+            ));
+            d.req(&format!("wait s{i} 3000 {}", 7000 + attempt * 100 + i))
+                .starts_with("OK")
         });
-        assert!(ok, "s{i} stopped responding:\n{}", d.screen(&format!("s{i}")));
+        assert!(
+            ok,
+            "s{i} stopped responding:\n{}",
+            d.screen(&format!("s{i}"))
+        );
     }
 }
 
@@ -122,9 +138,11 @@ fn spawn_kill_churn_leaks_nothing() {
         }
         d.ok(&format!("kill {name}"));
     }
-    wait_until("fds and threads back to baseline", Duration::from_secs(10), || {
-        fd_count(d.pid()) <= fds && thread_count(d.pid()) <= threads
-    });
+    wait_until(
+        "fds and threads back to baseline",
+        Duration::from_secs(10),
+        || fd_count(d.pid()) <= fds && thread_count(d.pid()) <= threads,
+    );
 }
 
 #[test]
@@ -135,7 +153,9 @@ fn exited_sessions_release_their_threads() {
         d.ok(&format!("spawn e{i} true"));
     }
     // sessions stay listed (with their exit status) but their I/O threads end
-    wait_until("io threads exit", Duration::from_secs(10), || thread_count(d.pid()) <= threads);
+    wait_until("io threads exit", Duration::from_secs(10), || {
+        thread_count(d.pid()) <= threads
+    });
     assert_eq!(d.ok("list").matches("exited(0)").count(), 50);
 }
 
@@ -143,7 +163,9 @@ fn exited_sessions_release_their_threads() {
 fn parallel_output_floods_across_sessions() {
     let d = Arc::new(Daemon::start());
     for i in 0..8 {
-        d.ok(&format!("spawn f{i} sh -c 'seq 1 300000; echo FLOOD-$((100+{i})); sleep 60'"));
+        d.ok(&format!(
+            "spawn f{i} sh -c 'seq 1 300000; echo FLOOD-$((100+{i})); sleep 60'"
+        ));
     }
     let start = Instant::now();
     let mut worst = Duration::ZERO;
@@ -151,46 +173,80 @@ fn parallel_output_floods_across_sessions() {
         let t = Instant::now();
         d.ok("list");
         worst = worst.max(t.elapsed());
-        let done = (0..8).filter(|i| d.screen(&format!("f{i}")).contains(&format!("FLOOD-{}", 100 + i))).count();
+        let done = (0..8)
+            .filter(|i| {
+                d.screen(&format!("f{i}"))
+                    .contains(&format!("FLOOD-{}", 100 + i))
+            })
+            .count();
         if done == 8 {
             break;
         }
-        assert!(start.elapsed() < Duration::from_secs(60), "floods did not finish");
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "floods did not finish"
+        );
     }
-    assert!(worst < Duration::from_millis(250), "list latency under 8 floods: {worst:?}");
+    assert!(
+        worst < Duration::from_millis(250),
+        "list latency under 8 floods: {worst:?}"
+    );
     for i in 0..8 {
-        let last: Vec<String> = d.ok(&format!("history f{i} 5")).lines().map(String::from).collect();
+        let last: Vec<String> = d
+            .ok(&format!("history f{i} 5"))
+            .lines()
+            .map(String::from)
+            .collect();
         assert!(last.iter().any(|l| l == "300000"), "f{i}: {last:?}");
     }
 }
 
 #[test]
 fn twenty_attachers_and_a_writer() {
+    use std::io::{Read, Write};
     let d = Daemon::start();
     d.bash("s");
-    let clients: Vec<_> = (0..20)
+    let mut stdins = Vec::new();
+    let readers: Vec<_> = (0..20)
         .map(|_| {
-            std::process::Command::new(BIN)
+            let mut c = std::process::Command::new(BIN)
                 .args(["attach", "s"])
                 .env("XUMUX_SOCK", &d.sock)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
                 .spawn()
-                .unwrap()
+                .unwrap();
+            stdins.push(c.stdin.take().unwrap());
+            let mut out = c.stdout.take().unwrap();
+            // drain like a real terminal would, while output is flowing
+            thread::spawn(move || {
+                let mut all = Vec::new();
+                let _ = out.read_to_end(&mut all);
+                let _ = c.wait();
+                String::from_utf8_lossy(&all).into_owned()
+            })
         })
         .collect();
-    wait_until("20 attached", Duration::from_secs(10), || d.info("s", "attached") == "20");
+    wait_until("20 attached", Duration::from_secs(10), || {
+        d.info("s", "attached") == "20"
+    });
     d.ok("send s seq 1 20000; echo FANOUT-$((40+2))\\r");
     d.ok("wait s 20000 FANOUT-42");
     thread::sleep(Duration::from_millis(300));
-    for mut c in clients {
-        use std::io::Write;
-        c.stdin.as_mut().unwrap().write_all(&[0x1d]).unwrap();
-        let out = String::from_utf8_lossy(&c.wait_with_output().unwrap().stdout).into_owned();
-        assert!(out.contains("FANOUT-42"), "an attached client missed output");
+    for mut stdin in stdins {
+        stdin.write_all(&[0x1d]).unwrap(); // detach
     }
-    wait_until("all detached", Duration::from_secs(5), || d.info("s", "attached") == "0");
+    for r in readers {
+        let out = r.join().unwrap();
+        assert!(
+            out.contains("19999") && out.contains("FANOUT-42"),
+            "an attached client missed output"
+        );
+    }
+    wait_until("all detached", Duration::from_secs(5), || {
+        d.info("s", "attached") == "0"
+    });
 }
 
 #[test]
@@ -200,7 +256,11 @@ fn rapid_resize_storm_on_a_tui() {
     d.wait("top", "load average");
     let mut rng = Rng(42);
     for _ in 0..500 {
-        d.ok(&format!("resize top {} {}", 1 + rng.below(200), 1 + rng.below(300)));
+        d.ok(&format!(
+            "resize top {} {}",
+            1 + rng.below(200),
+            1 + rng.below(300)
+        ));
     }
     d.ok("resize top 40 120");
     d.wait("top", "load average");

@@ -114,7 +114,11 @@ impl Daemon {
 
     /// Spawn an interactive bash and wait for its prompt.
     pub fn bash(&self, name: &str) -> u32 {
-        let pid = self.ok(&format!("spawn {name} {BASH}")).trim().parse().unwrap();
+        let pid = self
+            .ok(&format!("spawn {name} {BASH}"))
+            .trim()
+            .parse()
+            .unwrap();
         self.wait(name, "$");
         pid
     }
@@ -174,7 +178,11 @@ pub fn pids_matching(needle: &str) -> Vec<u32> {
         .filter(|&p| p != me && proc_alive(p))
         .filter(|p| {
             fs::read(format!("/proc/{p}/cmdline"))
-                .map(|c| String::from_utf8_lossy(&c).replace('\0', " ").contains(needle))
+                .map(|c| {
+                    String::from_utf8_lossy(&c)
+                        .replace('\0', " ")
+                        .contains(needle)
+                })
                 .unwrap_or(false)
         })
         .collect()
