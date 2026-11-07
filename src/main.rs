@@ -948,7 +948,7 @@ fn serve_attach(
         // snapshot and registration, so the client sees every byte exactly once.
         let mut o = lock(&s.out);
         let mut first = b"OK\n".to_vec();
-        first.extend_from_slice(lock(&s.term).redraw().as_bytes());
+        first.extend_from_slice(lock(&s.term).attach_paint().as_bytes());
         let viewer = Viewer { id, tx, lag };
         if !viewer.push(first.into()) {
             return Err("cannot queue the initial redraw".into());
@@ -1627,6 +1627,31 @@ impl Term {
         let mut out = String::from("\x1b[0m\x1b[H\x1b[2J");
         for r in 0..self.rows {
             out += &format!("\x1b[{};1H{}", r + 1, self.line(r));
+        }
+        out += &format!("\x1b[{};{}H", self.row + 1, self.col + 1);
+        out
+    }
+
+    /// What an attaching terminal receives first: the scrollback and the
+    /// screen as ordinary lines (so the viewer's own terminal keeps them in
+    /// its scrollback and can scroll up to read the session's past), then
+    /// the screen painted in place, row by row, and the cursor.
+    fn attach_paint(&self) -> String {
+        let mut out = String::from("\x1b[0m\r\n");
+        for l in &self.history {
+            out += l;
+            out += "\r\n";
+        }
+        for r in 0..self.rows {
+            out += &self.line(r);
+            if r + 1 < self.rows {
+                out += "\r\n";
+            }
+        }
+        // Repaint absolutely (no clear: a clear would wipe the lines just
+        // scrolled up without moving them into the viewer's scrollback).
+        for r in 0..self.rows {
+            out += &format!("\x1b[{};1H{}\x1b[K", r + 1, self.line(r));
         }
         out += &format!("\x1b[{};{}H", self.row + 1, self.col + 1);
         out

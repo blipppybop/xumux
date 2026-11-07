@@ -825,3 +825,28 @@ fn run_output_larger_than_history_does_not_break() {
     assert!(nums.len() >= 9_000, "{} lines", nums.len());
     assert!(out.ends_with("[xumux] quiet\n"));
 }
+
+#[test]
+fn attach_replays_scrollback_so_the_terminal_can_scroll_up() {
+    let d = Daemon::start();
+    d.bash("s");
+    d.ok("send s for i in $(seq 1 100); do echo LINE-$i; done\\r");
+    d.wait("s", "LINE-100");
+    let hist = d.ok("history s");
+    assert!(hist.contains("LINE-1\n"), "scrollback missing: {hist:?}");
+    let mut c = attach(&d, "s");
+    wait_until("attached", Duration::from_secs(5), || {
+        d.info("s", "attached") == "1"
+    });
+    c.stdin.as_mut().unwrap().write_all(&[0x1d]).unwrap(); // Ctrl-]
+    let out = collect(c);
+    // Lines that scrolled off the 24-row screen long ago still reach the
+    // attaching terminal, as plain lines it keeps in its own scrollback.
+    for n in [1, 2, 3, 50] {
+        assert!(out.contains(&format!("LINE-{n}\r\n")), "LINE-{n} not replayed: {out:?}");
+    }
+    // The live screen is then painted in place with the cursor where it is.
+    assert!(out.contains("LINE-100"), "screen missing: {out:?}");
+    assert!(!out.contains("\x1b[2J"), "attach must not clear the terminal (loses scrollback)");
+    assert!(out.contains("\x1b[1;1H"), "absolute repaint missing: {out:?}");
+}
