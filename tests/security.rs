@@ -599,3 +599,55 @@ fn explicit_socket_path_must_also_be_in_a_private_dir() {
     }
     assert!(!std::path::Path::new("/tmp/xumux-shared.sock").exists());
 }
+
+#[test]
+fn client_cap_replies_busy_then_recovers() {
+    let d = Daemon::start();
+    let idle: Vec<UnixStream> = (0..530)
+        .map(|_| UnixStream::connect(&d.sock).unwrap())
+        .collect();
+    let t = Instant::now();
+    let r = d.req("list");
+    assert!(t.elapsed() < Duration::from_secs(1));
+    assert!(r.starts_with("ERR busy"), "{r}");
+    drop(idle); // closed clients free their slots right away
+    wait_until("recovered", Duration::from_secs(10), || {
+        d.req("list").starts_with("OK")
+    });
+}
+
+#[test]
+fn vanished_viewer_is_unregistered_without_any_output() {
+    let d = Daemon::start();
+    d.ok("spawn quiet sleep 60"); // never prints
+    let mut sock = UnixStream::connect(&d.sock).unwrap();
+    sock.write_all(b"attach quiet 0 0\n").unwrap();
+    wait_until("attached", Duration::from_secs(5), || {
+        d.info("quiet", "attached") == "1"
+    });
+    drop(sock);
+    wait_until("unregistered", Duration::from_secs(5), || {
+        d.info("quiet", "attached") == "0"
+    });
+}
+
+#[test]
+fn typing_into_a_hung_program_still_allows_detach() {
+    let d = Daemon::start();
+    d.ok("spawn sink sh -c 'stty raw -echo; sleep 60'"); // never reads
+    thread::sleep(Duration::from_millis(200));
+    let mut sock = UnixStream::connect(&d.sock).unwrap();
+    sock.write_all(b"attach sink 0 0\n").unwrap();
+    wait_until("attached", Duration::from_secs(5), || {
+        d.info("sink", "attached") == "1"
+    });
+    let mut paste = vec![b'y'; 6 << 20]; // more than the 4 MiB input cap
+    paste.push(0x1d); // Ctrl-]
+    let t = Instant::now();
+    let _ = sock.write_all(&paste);
+    wait_until("detached", Duration::from_secs(15), || {
+        d.info("sink", "attached") == "0"
+    });
+    assert!(t.elapsed() < Duration::from_secs(15));
+    d.alive();
+}

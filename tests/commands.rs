@@ -726,3 +726,102 @@ fn guide_works_with_and_without_a_daemon() {
     let d = Daemon::start();
     assert_eq!(d.ok("guide"), text);
 }
+
+// ------------------------------------------------------------ robustness
+
+#[test]
+fn client_survives_a_closed_stdout_pipe() {
+    let d = Daemon::start();
+    d.bash("s");
+    d.ok("send s seq 1 2000\\r");
+    d.wait("s", "2000");
+    for cmd in ["guide", "history s", "screen s"] {
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(format!("{BIN} {cmd} | head -c 3; echo \"rc=$?\""))
+            .env("XUMUX_SOCK", &d.sock)
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !err.contains("panicked") && !err.contains("Broken pipe"),
+            "{cmd}: {err}"
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).ends_with("rc=0\n"));
+    }
+}
+
+#[test]
+fn daemon_starts_with_stderr_closed() {
+    let dir = private_dir();
+    let sock = dir.join("s.sock");
+    let mut c = Command::new("sh")
+        .arg("-c")
+        .arg(format!("exec {BIN} serve 2>&-"))
+        .env("XUMUX_SOCK", &sock)
+        .spawn()
+        .unwrap();
+    wait_until("socket", Duration::from_secs(5), || {
+        std::os::unix::net::UnixStream::connect(&sock).is_ok()
+    });
+    let mut s = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    s.write_all(b"list\n").unwrap();
+    let mut r = String::new();
+    s.read_to_string(&mut r).unwrap();
+    assert_eq!(r, "OK\n");
+    let _ = c.kill();
+    let _ = c.wait();
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn exited_sessions_are_pruned_at_the_cap() {
+    let d = Daemon::start();
+    for i in 0..300 {
+        d.ok(&format!("spawn e{i} true"));
+    }
+    wait_until("all exited", Duration::from_secs(20), || {
+        !d.ok("list").contains("running")
+    });
+    d.ok("spawn last sleep 60"); // pruning happens on spawn
+    let list = d.ok("list");
+    assert!(
+        list.lines().count() <= 257,
+        "{} sessions kept",
+        list.lines().count()
+    );
+    assert!(list.contains("last\t") && list.contains("e299\t") && !list.contains("e0\t"));
+}
+
+#[test]
+fn small_edge_cases() {
+    let d = Daemon::start();
+    d.bash("s");
+    assert_eq!(d.ok("history s 0"), "\n");
+    assert!(d.err("rename s s").contains("already exists"));
+    d.ok("send s"); // empty input is fine
+    d.ok("keys s");
+    d.ok("send s echo edge-$((1+1))\\r");
+    d.wait("s", "edge-2");
+    assert!(
+        d.err("wait s 0 never-there")
+            .contains("timed out after 0 ms")
+    );
+    assert_eq!(d.ok("wait s 0 edge-2"), "edge-2\n");
+    assert!(d.err("run s abc x").contains("usage"));
+    assert!(d.err("run nope 100 x").contains("no session"));
+    assert!(d.err("settle").contains("no session"));
+    assert!(d.err("history").contains("no session"));
+    assert!(d.err("resize s 10").contains("usage"));
+}
+
+#[test]
+fn run_output_larger_than_history_does_not_break() {
+    let d = Daemon::start();
+    d.bash("s");
+    let out = d.ok("run s 60000 seq 1 15000");
+    let nums: Vec<u32> = out.lines().filter_map(|l| l.parse().ok()).collect();
+    assert_eq!(nums.last(), Some(&15000));
+    assert!(nums.len() >= 9_000, "{} lines", nums.len());
+    assert!(out.ends_with("[xumux] quiet\n"));
+}

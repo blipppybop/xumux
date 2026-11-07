@@ -22,11 +22,12 @@ use std::net::Shutdown;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use std::{env, thread};
 
@@ -102,11 +103,15 @@ const WATCH_QUEUE: usize = 1 << 16; // hard cap on queued chunks (lag is bounded
 const USER_HZ: f64 = 100.0; // /proc reports CPU time in USER_HZ, fixed at 100 on Linux
 const DETACH_KEY: u8 = 0x1d; // Ctrl-]
 const DEFAULT_IDLE_MS: u64 = 300; // "quiet" for run/settle
+const MAX_CLIENTS: usize = 512; // concurrent client connections (each holds a thread)
+const MAX_DEAD: usize = 256; // exited sessions kept for reading; oldest are pruned
+const ATTACH_INPUT_WAIT: Duration = Duration::from_secs(2); // typing into a hung program
 const GUIDE: &str = include_str!("../AGENTS.md");
 /// Internal: the daemon starts programs as `/proc/self/exe __pty-exec CMD`.
 const PTY_EXEC: &str = "__pty-exec";
 
 struct Session {
+    seq: u64, // creation order, for pruning
     pid: u32,
     cmd: String,
     child: Mutex<Child>,
@@ -146,12 +151,16 @@ impl Input {
         })
     }
 
-    /// For attached keyboards: wait for room instead of failing.
+    /// For attached keyboards: wait (briefly) for room instead of failing.
+    /// Gives up if the program still isn't reading after ATTACH_INPUT_WAIT,
+    /// so a client can always detach from a hung program.
     fn push_wait(&self, bytes: Vec<u8>) -> Result<(), ()> {
+        let deadline = Instant::now() + ATTACH_INPUT_WAIT;
         loop {
             match self.push(bytes.clone()) {
                 Ok(()) => return Ok(()),
                 Err(e) if e.contains("closed") => return Err(()),
+                Err(_) if Instant::now() >= deadline => return Err(()),
                 Err(_) => thread::sleep(Duration::from_millis(10)),
             }
         }
@@ -186,6 +195,14 @@ impl Viewer {
 
 type Sessions = Arc<Mutex<HashMap<String, Arc<Session>>>>;
 
+/// Lock, recovering from poisoning: a panic in one thread must not take the
+/// daemon's other sessions and clients down with it.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+static CLIENTS: AtomicUsize = AtomicUsize::new(0);
+
 static SOCKET: OnceLock<PathBuf> = OnceLock::new();
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -193,11 +210,11 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None | Some("-h" | "--help" | "help") => {
-            eprint!("{USAGE}");
+            let _ = io::stderr().write_all(USAGE.as_bytes());
             std::process::exit(2)
         }
         Some("serve") => serve(),
-        Some("guide") => print!("{GUIDE}"),
+        Some("guide") => emit(GUIDE),
         Some(PTY_EXEC) => pty_exec(&args),
         Some("attach") => attach(&args),
         _ => client(&args),
@@ -251,8 +268,25 @@ fn check_private_dir(dir: &Path) -> Result<(), String> {
 }
 
 fn die(msg: impl std::fmt::Display) -> ! {
-    eprintln!("xumux: {msg}");
+    note(format!("xumux: {msg}"));
     std::process::exit(1)
+}
+
+/// stderr, ignoring a closed stream (never panic over a diagnostic).
+fn note(msg: impl std::fmt::Display) {
+    let _ = writeln!(io::stderr(), "{msg}");
+}
+
+/// stdout, exiting quietly when the reader is gone (`xumux screen x | head`).
+fn emit(s: &str) {
+    let mut out = io::stdout().lock();
+    if out
+        .write_all(s.as_bytes())
+        .and_then(|_| out.flush())
+        .is_err()
+    {
+        std::process::exit(0);
+    }
 }
 
 fn connect() -> UnixStream {
@@ -283,7 +317,7 @@ fn client(args: &[String]) {
     let mut reply = String::new();
     stream.read_to_string(&mut reply).unwrap_or_else(|e| die(e));
     match reply.strip_prefix("OK\n") {
-        Some(body) => print!("{body}"),
+        Some(body) => emit(body),
         None => die(reply.strip_prefix("ERR ").unwrap_or(&reply).trim_end()),
     }
 }
@@ -306,7 +340,10 @@ fn attach(args: &[String]) {
     if status != "OK" {
         die(status.strip_prefix("ERR ").unwrap_or(&status));
     }
-    eprint!("[xumux: attached to {name}; Ctrl-] detaches]\r\n");
+    let _ = write!(
+        io::stderr(),
+        "[xumux: attached to {name}; Ctrl-] detaches]\r\n"
+    );
     let raw = sys::RawMode::enter(&io::stdin()); // restored on drop
     let mut to_server = stream.try_clone().unwrap_or_else(|e| die(e));
     thread::spawn(move || {
@@ -324,8 +361,8 @@ fn attach(args: &[String]) {
                 return;
             }
         }
-        // stdin ended (e.g. piped input): keep showing output until the session ends.
-        let _ = to_server.shutdown(Shutdown::Write);
+        // stdin ended (e.g. piped input): keep showing output until the session
+        // ends. Don't half-close: the daemon reads end-of-input as "client gone".
     });
     let mut stdout = io::stdout().lock();
     let mut buf = [0u8; 16384];
@@ -358,14 +395,29 @@ fn serve() {
         Err(e) => die(format!("{}: {e}", path.display())),
     };
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap_or_else(|e| die(e));
-    eprintln!("xumux listening on {}", path.display());
+    note(format!("xumux listening on {}", path.display()));
     let _ = SOCKET.set(path);
+
+    // A panicking thread prints its message and dies; nothing else should.
+    panic::set_hook(Box::new(|info| {
+        note(format!("xumux: internal error: {info}"))
+    }));
 
     let sessions: Sessions = Default::default();
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
+        if CLIENTS.fetch_add(1, Ordering::AcqRel) >= MAX_CLIENTS {
+            CLIENTS.fetch_sub(1, Ordering::AcqRel);
+            // Off the accept thread: the reply is only delivered once the
+            // request bytes are drained (see finish_reply).
+            thread::spawn(move || finish_reply(&stream, "ERR busy: too many clients\n"));
+            continue;
+        }
         let sessions = sessions.clone();
-        thread::spawn(move || handle(stream, &sessions));
+        thread::spawn(move || {
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| handle(stream, &sessions)));
+            CLIENTS.fetch_sub(1, Ordering::AcqRel);
+        });
     }
 }
 
@@ -385,19 +437,17 @@ fn handle(stream: UnixStream, sessions: &Sessions) {
             Ok(()) => return,
             Err(e) => Err(e),
         },
-        Ok((line, _)) => dispatch(line, sessions),
+        Ok((line, _)) => panic::catch_unwind(AssertUnwindSafe(|| dispatch(line, sessions)))
+            .unwrap_or_else(|_| Err("internal error (reported on the daemon's stderr)".into())),
     };
     let reply = match result {
         Ok(body) => format!("OK\n{body}"),
         Err(e) => format!("ERR {e}\n"),
     };
-    let _ = (&stream).write_all(reply.as_bytes());
     if request.is_err() {
-        // Closing with unread input makes Linux reset the connection, which
-        // would destroy the ERR reply before the client reads it. Drain briefly.
-        let _ = stream.shutdown(Shutdown::Write);
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-        let _ = io::copy(&mut (&stream).take(16 << 20), &mut io::sink());
+        finish_reply(&stream, &reply);
+    } else {
+        let _ = (&stream).write_all(reply.as_bytes());
     }
     if cmd == "shutdown" && reply.starts_with("OK") {
         if let Some(p) = SOCKET.get() {
@@ -405,6 +455,16 @@ fn handle(stream: UnixStream, sessions: &Sessions) {
         }
         std::process::exit(0);
     }
+}
+
+/// Send a reply to a client whose request was not fully consumed. Closing a
+/// Unix socket with unread input makes Linux reset the connection, which would
+/// destroy the reply before the client reads it, so drain briefly first.
+fn finish_reply(stream: &UnixStream, reply: &str) {
+    let _ = (&*stream).write_all(reply.as_bytes());
+    let _ = stream.shutdown(Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+    let _ = io::copy(&mut stream.take(16 << 20), &mut io::sink());
 }
 
 /// Read one request line. Returns it plus any bytes that arrived after the
@@ -497,7 +557,7 @@ fn dim(s: &str) -> Result<u16, String> {
 }
 
 fn status(s: &Session) -> String {
-    match s.child.lock().unwrap().try_wait() {
+    match lock(&s.child).try_wait() {
         Ok(None) => "running".into(),
         Ok(Some(st)) => match (st.code(), st.signal()) {
             (Some(c), _) => format!("exited({c})"),
@@ -512,21 +572,32 @@ fn queue_input(s: &Session, bytes: Vec<u8>) -> Result<String, String> {
     s.input.push(bytes).map(|()| String::new())
 }
 
-/// The job in the terminal's foreground, if it isn't the session's own
-/// program: `tpgid` (field 8 of /proc/PID/stat) is the foreground process
-/// group. A shell at its prompt owns the foreground; a running command doesn't.
-fn foreground_job(leader: u32) -> Option<(u32, String)> {
+/// What the session's program is doing, from /proc/PID/stat.
+struct Activity {
+    /// The program itself is running or runnable (state R): e.g. a shell
+    /// parsing a command it has not forked yet.
+    running: bool,
+    /// The job in the terminal's foreground, if it isn't the program itself:
+    /// `tpgid` (field 8) is the foreground process group. A shell at its
+    /// prompt owns the foreground; a command it is waiting for doesn't.
+    job: Option<(u32, String)>,
+}
+
+fn activity(leader: u32) -> Option<Activity> {
     let stat = fs::read_to_string(format!("/proc/{leader}/stat")).ok()?;
-    let tpgid: i64 = stat[stat.rfind(')')? + 1..]
-        .split_whitespace()
-        .nth(5)?
-        .parse()
-        .ok()?;
-    if tpgid <= 0 || tpgid == i64::from(leader) {
-        return None;
-    }
-    let comm = fs::read_to_string(format!("/proc/{tpgid}/comm")).unwrap_or_default();
-    Some((tpgid as u32, comm.trim().to_string()))
+    let f: Vec<&str> = stat[stat.rfind(')')? + 1..].split_whitespace().collect();
+    let running = f.first().is_some_and(|st| *st == "R");
+    let tpgid: i64 = f.get(5)?.parse().ok()?;
+    let job = (tpgid > 0 && tpgid != i64::from(leader)).then(|| {
+        let comm = fs::read_to_string(format!("/proc/{tpgid}/comm")).unwrap_or_default();
+        (tpgid as u32, comm.trim().to_string())
+    });
+    Some(Activity { running, job })
+}
+
+/// The foreground job of a session, if any (for `info`).
+fn foreground_job(leader: u32) -> Option<(u32, String)> {
+    activity(leader)?.job
 }
 
 /// Wait until the session is done: no foreground job is running and output
@@ -541,13 +612,14 @@ fn settle(s: &Session, timeout_ms: u64, idle_ms: u64) -> String {
         if s.closed.load(Ordering::Acquire) {
             return status(s);
         }
-        let job = foreground_job(s.pid);
-        let last = s.term.lock().unwrap().last_output.max(begin);
-        if job.is_none() && last.elapsed() >= idle {
+        let act = activity(s.pid);
+        let busy = act.as_ref().is_some_and(|a| a.running || a.job.is_some());
+        let last = lock(&s.term).last_output.max(begin);
+        if !busy && last.elapsed() >= idle {
             return "quiet".into();
         }
         if Instant::now() >= deadline {
-            return match job {
+            return match act.and_then(|a| a.job) {
                 Some((_, comm)) => format!("timeout: {comm} still running"),
                 None => "timeout".into(),
             };
@@ -557,7 +629,7 @@ fn settle(s: &Session, timeout_ms: u64, idle_ms: u64) -> String {
 
 fn resize_session(s: &Session, rows: u16, cols: u16) -> Result<(), String> {
     sys::set_size(&s.master, rows, cols).map_err(err)?;
-    s.term.lock().unwrap().resize(rows.into(), cols.into());
+    lock(&s.term).resize(rows.into(), cols.into());
     Ok(())
 }
 
@@ -565,7 +637,7 @@ fn resize_session(s: &Session, rows: u16, cols: u16) -> Result<(), String> {
 /// descendants, plus anything still in its session (orphaned background jobs
 /// get reparented but keep the session id).
 fn kill_session(s: &Session) {
-    let mut child = s.child.lock().unwrap();
+    let mut child = lock(&s.child);
     let alive = matches!(child.try_wait(), Ok(None));
     let all = procs();
     let mut doomed: Vec<u32> = all
@@ -610,7 +682,7 @@ fn dispatch(line: &str, sessions: &Sessions) -> Result<String, String> {
         }
         "screen" => {
             let s = get(sessions, rest.trim())?;
-            let contents = s.term.lock().unwrap().contents();
+            let contents = lock(&s.term).contents();
             Ok(format!("{contents}\n"))
         }
         "history" => {
@@ -623,7 +695,7 @@ fn dispatch(line: &str, sessions: &Sessions) -> Result<String, String> {
                 ),
                 None => None,
             };
-            let text = s.term.lock().unwrap().history_text(lines);
+            let text = lock(&s.term).history_text(lines);
             Ok(format!("{text}\n"))
         }
         "wait" => {
@@ -639,7 +711,7 @@ fn dispatch(line: &str, sessions: &Sessions) -> Result<String, String> {
             let s = get(sessions, name)?;
             let deadline = Instant::now() + Duration::from_millis(ms.min(MAX_WAIT_MS));
             loop {
-                let screen = s.term.lock().unwrap().contents();
+                let screen = lock(&s.term).contents();
                 if let Some(hit) = wanted.iter().find(|w| screen.contains(**w)) {
                     return Ok(format!("{hit}\n"));
                 }
@@ -659,12 +731,12 @@ fn dispatch(line: &str, sessions: &Sessions) -> Result<String, String> {
             let (ms, text) = split1(rest);
             let ms: u64 = ms.parse().map_err(|_| "usage: run NAME MS TEXT")?;
             let s = get(sessions, name)?;
-            let start = s.term.lock().unwrap().mark();
+            let start = lock(&s.term).mark();
             let mut bytes = unescape(text)?;
             bytes.push(b'\r');
             queue_input(&s, bytes)?;
             let status = settle(&s, ms, DEFAULT_IDLE_MS);
-            let out = s.term.lock().unwrap().since(start);
+            let out = lock(&s.term).since(start);
             Ok(format!("{out}\n[xumux] {status}\n"))
         }
         "settle" => {
@@ -702,7 +774,7 @@ fn dispatch(line: &str, sessions: &Sessions) -> Result<String, String> {
         }
         "guide" => Ok(GUIDE.to_string()),
         "list" => {
-            let map = sessions.lock().unwrap();
+            let map = lock(sessions);
             let mut names: Vec<_> = map.keys().collect();
             names.sort();
             let mut out = String::new();
@@ -714,8 +786,8 @@ fn dispatch(line: &str, sessions: &Sessions) -> Result<String, String> {
         }
         "info" => {
             let s = get(sessions, rest.trim())?;
-            let o = s.out.lock().unwrap();
-            let t = s.term.lock().unwrap();
+            let o = lock(&s.out);
+            let t = lock(&s.term);
             let log = o
                 .log
                 .as_ref()
@@ -741,7 +813,7 @@ fn dispatch(line: &str, sessions: &Sessions) -> Result<String, String> {
             let (name, path) = split1(rest);
             let s = get(sessions, name)?;
             if path == "off" {
-                s.out.lock().unwrap().log = None;
+                lock(&s.out).log = None;
                 return Ok(String::new());
             }
             let path = PathBuf::from(path);
@@ -759,7 +831,7 @@ fn dispatch(line: &str, sessions: &Sessions) -> Result<String, String> {
             if !f.metadata().map_err(err)?.is_file() {
                 return Err(format!("{}: not a regular file", path.display()));
             }
-            s.out.lock().unwrap().log = Some((path, f));
+            lock(&s.out).log = Some((path, f));
             Ok(String::new())
         }
         "stats" => stats(get(sessions, rest.trim())?.pid),
@@ -779,7 +851,7 @@ fn dispatch(line: &str, sessions: &Sessions) -> Result<String, String> {
                 return Err("usage: rename NAME NEW".into());
             };
             valid_name(new)?;
-            let mut map = sessions.lock().unwrap();
+            let mut map = lock(sessions);
             if map.contains_key(new) {
                 return Err(format!("session '{new}' already exists"));
             }
@@ -800,7 +872,7 @@ fn dispatch(line: &str, sessions: &Sessions) -> Result<String, String> {
             Ok(String::new())
         }
         "shutdown" => {
-            let all: Vec<_> = sessions.lock().unwrap().drain().map(|(_, s)| s).collect();
+            let all: Vec<_> = lock(sessions).drain().map(|(_, s)| s).collect();
             for s in &all {
                 kill_session(s);
             }
@@ -841,9 +913,9 @@ fn serve_attach(
     {
         // Holding `out` keeps the reader from sending output between the
         // snapshot and registration, so the client sees every byte exactly once.
-        let mut o = s.out.lock().unwrap();
+        let mut o = lock(&s.out);
         let mut first = b"OK\n".to_vec();
-        first.extend_from_slice(s.term.lock().unwrap().redraw().as_bytes());
+        first.extend_from_slice(lock(&s.term).redraw().as_bytes());
         let viewer = Viewer { id, tx, lag };
         if !viewer.push(first.into()) {
             return Err("cannot queue the initial redraw".into());
@@ -856,22 +928,30 @@ fn serve_attach(
     // ends or a write to it fails.
     let mut buf = [0u8; 4096];
     let mut pending = typed.to_vec();
+    let mut dropping = false; // the program stopped reading: don't wait on every chunk
     loop {
         let detach = pending.iter().position(|&b| b == DETACH_KEY);
         let keys = &pending[..detach.unwrap_or(pending.len())];
-        if !keys.is_empty() && s.input.push_wait(keys.to_vec()).is_err() {
-            break;
+        // Keystrokes the program won't take are dropped, not queued forever,
+        // so Ctrl-] always gets through within ATTACH_INPUT_WAIT.
+        if !keys.is_empty() {
+            dropping = if dropping {
+                s.input.push(keys.to_vec()).is_err()
+            } else {
+                s.input.push_wait(keys.to_vec()).is_err()
+            };
         }
         if detach.is_some() {
-            s.out.lock().unwrap().watchers.retain(|v| v.id != id);
-            let _ = stream.shutdown(Shutdown::Both);
             break;
         }
         match (&*stream).read(&mut buf) {
             Ok(n @ 1..) => pending = buf[..n].to_vec(),
-            _ => break,
+            _ => break, // client went away
         }
     }
+    // Unregister on every exit path, so a vanished client is never still "attached".
+    lock(&s.out).watchers.retain(|v| v.id != id);
+    let _ = stream.shutdown(Shutdown::Both);
     Ok(())
 }
 
@@ -901,7 +981,7 @@ fn open_pty_dev(path: &str, flags: i32) -> io::Result<File> {
 }
 
 fn spawn(name: &str, command: &str, sessions: &Sessions) -> Result<String, String> {
-    if sessions.lock().unwrap().contains_key(name) {
+    if lock(sessions).contains_key(name) {
         return Err(format!("session '{name}' already exists"));
     }
     // O_NONBLOCK: both I/O threads wait in poll(); a blocking write to a PTY
@@ -984,10 +1064,14 @@ fn spawn(name: &str, command: &str, sessions: &Sessions) -> Result<String, Strin
                 Err(_) => break, // EIO once the child side is closed
             };
             let chunk = &buf[..n];
-            let mut o = fanout.lock().unwrap();
+            let mut o = lock(&fanout);
             let reply = {
-                let mut t = feed.lock().unwrap();
-                t.feed(chunk);
+                let mut t = lock(&feed);
+                if panic::catch_unwind(AssertUnwindSafe(|| t.feed(chunk))).is_err() {
+                    // Emulator bug on this input: lose this screen, keep the session.
+                    let (rows, cols) = (t.rows, t.cols);
+                    *t = Term::new(rows, cols);
+                }
                 std::mem::take(&mut t.reply)
             };
             if !reply.is_empty() {
@@ -1006,19 +1090,21 @@ fn spawn(name: &str, command: &str, sessions: &Sessions) -> Result<String, Strin
         }
         done.store(true, Ordering::Release);
         drop(answer);
-        fanout.lock().unwrap().watchers.clear(); // senders flush, then close: clients see EOF
+        lock(&fanout).watchers.clear(); // senders flush, then close: clients see EOF
     });
 
     let pid = child.id();
-    let mut map = sessions.lock().unwrap();
+    let mut map = lock(sessions);
     if map.contains_key(name) {
         let _ = child.kill();
         let _ = child.wait();
         return Err(format!("session '{name}' already exists"));
     }
+    prune_dead(&mut map);
     map.insert(
         name.to_string(),
         Arc::new(Session {
+            seq: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             pid,
             cmd: command.to_string(),
             child: Mutex::new(child),
@@ -1030,6 +1116,22 @@ fn spawn(name: &str, command: &str, sessions: &Sessions) -> Result<String, Strin
         }),
     );
     Ok(format!("{pid}\n"))
+}
+
+/// Keep at most MAX_DEAD exited sessions (their output stays readable until
+/// then); drop the oldest beyond that so fds and memory stay bounded.
+fn prune_dead(map: &mut HashMap<String, Arc<Session>>) {
+    let mut dead: Vec<(u64, String)> = map
+        .iter()
+        .filter(|(_, s)| status(s) != "running")
+        .map(|(n, s)| (s.seq, n.clone()))
+        .collect();
+    if dead.len() > MAX_DEAD {
+        dead.sort();
+        for (_, name) in &dead[..dead.len() - MAX_DEAD] {
+            map.remove(name);
+        }
+    }
 }
 
 /// tmux `send-keys` style: each word is a key name if it is one, otherwise
@@ -1571,6 +1673,10 @@ impl Term {
                     self.osc_done();
                     self.state = Ground;
                 }
+                0x18 | 0x1a => {
+                    self.osc.clear();
+                    self.state = Ground;
+                }
                 0x1b => {
                     self.osc_done();
                     self.state = OscEsc;
@@ -1581,11 +1687,11 @@ impl Term {
                     }
                 }
             },
-            Str => {
-                if b == 0x1b {
-                    self.state = StrEsc;
-                }
-            }
+            Str => match b {
+                0x1b => self.state = StrEsc,
+                0x18 | 0x1a => self.state = Ground,
+                _ => {}
+            },
             // ESC inside a string: `ESC \` terminates it; anything else starts a new escape.
             OscEsc | StrEsc => {
                 self.state = Esc;
@@ -2097,6 +2203,43 @@ mod tests {
         for bad in ["", "a b", "a\tb", "../x", "a/b", "é", &"x".repeat(65)] {
             assert!(valid_name(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn can_and_sub_abort_strings() {
+        // An unterminated OSC/DCS must not swallow everything after it.
+        assert_eq!(term(1, 20, "\x1b]0;title\x18visible").contents(), "visible");
+        assert_eq!(term(1, 20, "\x1bPdata\x1avisible").contents(), "visible");
+        assert_eq!(term(1, 20, "\x1b]0;t\x18").title, "");
+    }
+
+    #[test]
+    fn poisoned_mutex_is_recovered() {
+        let m = Arc::new(Mutex::new(1));
+        let m2 = m.clone();
+        let _ = thread::spawn(move || {
+            let _g = lock(&m2);
+            panic!("poison");
+        })
+        .join();
+        assert!(m.is_poisoned());
+        *lock(&m) += 1;
+        assert_eq!(*lock(&m), 2);
+    }
+
+    #[test]
+    fn since_and_history_are_consistent_across_resets_and_overflow() {
+        let mut t = Term::new(3, 8);
+        let mark = t.mark();
+        for i in 0..(HISTORY_LINES + 50) {
+            t.feed(format!("{i}\r\n").as_bytes());
+        }
+        let out = t.since(mark);
+        assert!(out.lines().count() >= HISTORY_LINES);
+        assert!(out.lines().any(|l| l == "10049"));
+        t.feed(b"\x1bc"); // RIS keeps history
+        assert_eq!(t.history.len(), HISTORY_LINES);
+        assert_eq!(t.since(u64::MAX), ""); // a mark in the future yields nothing
     }
 
     #[test]

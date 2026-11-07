@@ -126,7 +126,7 @@ Status values: `running`, `exited(N)`, `killed(sig N)`. Names are 1–64 charact
 5. **Keep your context small.** Prefer `run` (new output only) and `history NAME 20` over full `screen` or `history` dumps.
 6. **Never `attach` from a tool call.** It's interactive and waits for a keyboard. It's for humans.
 7. **Check before you assume.** `xumux list` shows whether a session is still `running` or has `exited(N)`.
-8. **Clean up.** Kill the sessions you created when you're done.
+8. **Clean up.** Kill the sessions you created when you're done. Exited sessions stay readable until killed; only the 256 most recent are kept.
 
 ## 5. Errors you may see
 
@@ -138,3 +138,5 @@ Status values: `running`, `exited(N)`, `killed(sig N)`. Names are 1–64 charact
 | `timed out after N ms ...` | the text never appeared; check `screen` |
 | `session exited before ... appeared` | the program ended; read `history NAME 30` |
 | `input queue full ...` | the program isn't reading input (busy or hung); try `keys NAME C-c` |
+| `busy: too many clients` | more than 512 connections open at once; retry after a moment |
+| `internal error ...` | a bug in xumux; the session survives, the daemon keeps running |

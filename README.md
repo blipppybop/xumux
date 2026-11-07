@@ -4,7 +4,7 @@
 
 ### The zero-dependency terminal multiplexer for programs, scripts and AI agents
 
-`0 dependencies` · `1 Rust file` · `590 KiB binary` · `100 tests` · `Linux` · `MIT`
+`0 dependencies` · `1 Rust file` · `629 KiB binary` · `111 tests` · `Linux` · `MIT`
 
 </div>
 
@@ -26,9 +26,9 @@
 
 |                         | **xumux**                                     | tmux                                     |
 |-------------------------|-----------------------------------------------|------------------------------------------|
-| Source                  | **2,012 lines**, 1 file                       | 114,498 lines, 157 files                 |
+| Source                  | **2,118 lines**, 1 file                       | 114,498 lines, 157 files                 |
 | Dependencies            | **none**                                      | libevent, ncurses (+ utf8proc, jemalloc) |
-| Binary                  | **590 KiB**, statically linked Rust           | plus shared libraries                    |
+| Binary                  | **629 KiB**, statically linked Rust           | plus shared libraries                    |
 | Clean build             | **4.8 s**, offline                            | autotools + library headers              |
 | Idle daemon memory      | **2.5 MiB**                                   |                                          |
 | Built for               | programs and agents (people via `attach`)     | people at a keyboard                     |
@@ -89,18 +89,18 @@ Intel Core i5-14500 (20 threads), Linux 6.14, Rust 1.97, release build. Latencie
 
 | Benchmark | Result |
 |---|---|
-| Daemon start → accepting connections | **2.7 ms** |
-| Idle daemon memory (RSS) | **2.6 MiB** |
-| `list` round trip | **218 µs** median · 365 µs p99 |
-| `send` round trip | **213 µs** median · 329 µs p99 |
-| `info` round trip | **282 µs** median · 428 µs p99 |
-| `screen` round trip (full 40×120 screen) | **299 µs** median · 445 µs p99 |
+| Daemon start → accepting connections | **2.8 ms** |
+| Idle daemon memory (RSS) | **2.7 MiB** |
+| `list` round trip | **214 µs** median · 353 µs p99 |
+| `send` round trip | **210 µs** median · 327 µs p99 |
+| `info` round trip | **280 µs** median · 412 µs p99 |
+| `screen` round trip (full 40×120 screen) | **301 µs** median · 443 µs p99 |
 | `xumux list` from a shell (process start + request) | **3.4 ms** median |
-| Throughput, 16 concurrent clients | **17,700 requests/s** |
-| `spawn` (PTY + `posix_spawn`), with 200 sessions open | **1.7 ms** median · 20.6 ms p99 |
-| Spawn → first output seen by `wait` | **12 ms** median |
-| Daemon with 250 sessions open | **26.9 MiB** RSS · 2 threads per running session |
-| `kill` (whole process tree, reaped) | **19 ms** median |
+| Throughput, 16 concurrent clients | **13,000 requests/s** |
+| `spawn` (PTY + `posix_spawn`), with 200 sessions open | **1.9 ms** median · 24.8 ms p99 |
+| Spawn → first output seen by `wait` | **13 ms** median |
+| Daemon with 250 sessions open | **25.7 MiB** RSS · 2 threads per running session |
+| `kill` (whole process tree, reaped) | **17 ms** median |
 | Output throughput, PTY → emulator (200 MiB) | **75 MiB/s** |
 
 Reproduce with:
@@ -113,6 +113,16 @@ Two design choices behind these numbers:
 
 - **`spawn` never forks the daemon.** Programs start as `/proc/self/exe __pty-exec CMD` via `posix_spawn`, and that helper takes the terminal and then execs the shell. `fork()` copies the parent's memory map, and the daemon's grows with every session: `spawn` used to take 12 ms with 200 sessions open, and now takes 1.6 ms at any count.
 - **Nothing waits on anything slow.** Each session has a writer thread with a bounded input queue, and each attached viewer has its own sender with a bounded output queue. A program that doesn't read its input, or a viewer that doesn't read its output, can't stall the session or the daemon.
+
+## Robustness
+
+A multiplexer is only useful if it outlives the programs inside it. Design rules, each with a test:
+
+- **A bug never takes the daemon down.** Panics unwind instead of aborting. A panic while handling a request is caught and answered with `ERR internal error`; a panic inside the terminal emulator resets that one session's screen and keeps the session; a poisoned lock is recovered instead of cascading. The emulator is also fuzzed with ~900,000 random inputs so this path should never be needed.
+- **Everything is bounded.** Request size (1 MiB), request time (5 s), pending input per session (4 MiB), viewer lag (8 MiB), concurrent clients (512, then `ERR busy`), exited sessions kept for reading (256, oldest pruned), PTY size (1000×1000), scrollback (10,000 lines), name length (64).
+- **Clients never panic on a closed pipe.** `xumux history s | head -1` exits quietly; a daemon started with stderr closed still runs.
+- **Attach always lets go.** A viewer that disconnects is unregistered right away, even from a silent session, and `Ctrl-]` gets through within 2 s even when pasting into a program that has stopped reading its input.
+- **`run` knows the difference between "quiet" and "done".** It waits for the shell to have no foreground job *and* not be runnable, so a command that is still being forked under heavy load isn't reported finished.
 
 ## Security
 
@@ -128,7 +138,7 @@ The threat model has two parts: other users on the same machine, and hostile pro
 - **Hostile programs can't stall xumux.** Query floods, output floods, raw `/dev/urandom`, unread input and stalled viewers are all tested. Pending input is capped at 4 MiB per session.
 - **Safe logging.** `log` opens only regular files, non-blocking, with mode `0600`. A FIFO with no reader fails right away instead of hanging the session.
 
-**Found and fixed during the audit:** 20 issues, 13 of them security-relevant. They include a reply-flood deadlock in raw mode, a writer thread leaked when a program stopped reading, slow-loris requests, a `/tmp` socket hijack, a group-writable socket window under `umask 002`, unbounded queued input, escape injection through `screen`, stalled viewers slowing a session, and `log` hanging on a FIFO. Each one now has a regression test.
+**Found and fixed during the audits:** 29 issues, 13 of them security-relevant. They include a reply-flood deadlock in raw mode, a writer thread leaked when a program stopped reading, slow-loris requests, a `/tmp` socket hijack, a group-writable socket window under `umask 002`, unbounded queued input, escape injection through `screen`, stalled viewers slowing a session, and `log` hanging on a FIFO. Each one now has a regression test.
 
 ## Zero dependencies, in detail
 
@@ -142,15 +152,15 @@ The cost is that this code is ours to maintain instead of borrowed. That's the t
 ## Tests
 
 ```sh
-cargo test --release          # 100 tests: unit, security, commands, swarm
+cargo test --release          # 111 tests: unit, security, commands, swarm
 cargo test                    # the same in debug, with overflow checks
 ```
 
 | Suite | Tests | Covers |
 |---|---|---|
-| unit (`src/main.rs`) | 14 | emulator behavior, sanitizing, name rules, ~900,000-input stress test |
-| [`security.rs`](tests/security.rs) | 31 | socket and directory checks, protocol abuse, isolation, hostile programs |
-| [`commands.rs`](tests/commands.rs) | 47 | every command and its errors, through the socket and the real CLI; `run`/`settle`/`wait-exit` on shells, a REPL and a TUI |
+| unit (`src/main.rs`) | 17 | emulator behavior, sanitizing, name rules, lock recovery, ~900,000-input stress test |
+| [`security.rs`](tests/security.rs) | 34 | socket and directory checks, protocol abuse, isolation, hostile programs |
+| [`commands.rs`](tests/commands.rs) | 52 | every command and its errors, through the socket and the real CLI; `run`/`settle`/`wait-exit` on shells, a REPL and a TUI; closed pipes, pruning, edge cases |
 | [`swarm.rs`](tests/swarm.rs) | 8 | 200 concurrent sessions, 32 clients × 250 mixed commands, 300 spawn/kill cycles with leak checks, parallel floods, 20 viewers, resize storms |
 
 Each test runs its own daemon on its own private socket.
@@ -168,7 +178,8 @@ printf 'list\n' | nc -U "$XDG_RUNTIME_DIR/xumux.sock"
 ## Limitations
 
 - **Linux only:** x86, x86_64, arm, aarch64 and riscv64. Other targets fail at compile time rather than misbehave.
-- **Sessions live in the daemon.** Restarting `xumux serve` ends them, just like `tmux kill-server`.
+- **Sessions live in the daemon.** Restarting `xumux serve` ends them, just like `tmux kill-server`. Exited sessions stay listed (output readable) until you `kill` them or 256 newer ones have exited.
+- **Programs that daemonize** (double-fork into a new session) escape `kill`, as they do in tmux.
 - **`screen` and `history` are text only.** Colors and combining accents are dropped; `log` and `attach` keep the raw bytes, colors included.
 - **Character widths** come from a built-in table that covers CJK and common emoji. Rare symbols may be measured differently than the program expects.
 
