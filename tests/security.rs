@@ -606,10 +606,20 @@ fn client_cap_replies_busy_then_recovers() {
     let idle: Vec<UnixStream> = (0..530)
         .map(|_| UnixStream::connect(&d.sock).unwrap())
         .collect();
+    // While the flood is being absorbed a connection may be dropped outright
+    // (reset) instead of answered; within two seconds one must get "ERR busy".
     let t = Instant::now();
-    let r = d.req("list");
-    assert!(t.elapsed() < Duration::from_secs(1));
-    assert!(r.starts_with("ERR busy"), "{r}");
+    let mut r = String::new();
+    while t.elapsed() < Duration::from_secs(2) {
+        if let Ok(mut s) = UnixStream::connect(&d.sock) {
+            r.clear();
+            if s.write_all(b"list\n").is_ok() && s.read_to_string(&mut r).is_ok() && !r.is_empty() {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(r.starts_with("ERR busy"), "{r:?} after {:?}", t.elapsed());
     drop(idle); // closed clients free their slots right away
     wait_until("recovered", Duration::from_secs(10), || {
         d.req("list").starts_with("OK")

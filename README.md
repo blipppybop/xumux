@@ -4,7 +4,7 @@
 
 ### The zero-dependency terminal multiplexer for programs, scripts and AI agents
 
-`0 dependencies` · `1 Rust file` · `629 KiB binary` · `111 tests` · `Linux` · `MIT`
+`0 dependencies` · `1 Rust file` · `635 KiB binary` · `119 tests` · `Linux` · `MIT`
 
 </div>
 
@@ -26,13 +26,13 @@
 
 |                         | **xumux**                                     | tmux                                     |
 |-------------------------|-----------------------------------------------|------------------------------------------|
-| Source                  | **2,118 lines**, 1 file                       | 114,498 lines, 157 files                 |
+| Source                  | **2,185 lines**, 1 file                       | 114,498 lines, 157 files                 |
 | Dependencies            | **none**                                      | libevent, ncurses (+ utf8proc, jemalloc) |
-| Binary                  | **629 KiB**, statically linked Rust           | plus shared libraries                    |
+| Binary                  | **635 KiB**, statically linked Rust           | plus shared libraries                    |
 | Clean build             | **4.8 s**, offline                            | autotools + library headers              |
 | Idle daemon memory      | **2.5 MiB**                                   |                                          |
 | Built for               | programs and agents (people via `attach`)     | people at a keyboard                     |
-| Memory safety           | Rust; `#![deny(unsafe_code)]`, 7 libc calls   | C                                        |
+| Memory safety           | Rust; `#![deny(unsafe_code)]`, 9 libc calls   | C                                        |
 
 <sub>Total lines of source, including comments and blanks; xumux's count leaves out its tests. tmux counted at commit `a73616d` (2026-10-30).</sub>
 
@@ -133,16 +133,16 @@ The threat model has two parts: other users on the same machine, and hostile pro
 - **Private socket.** The socket is mode `0600`. Its directory, including one you pick with `$XUMUX_SOCK`, must be a real directory (not a symlink) that you own with mode `700`, or xumux refuses to run. That's what keeps other users out, and stops anyone from pre-creating or swapping the socket. Without `$XDG_RUNTIME_DIR` it uses `/tmp/xumux-$UID`, created with mode `0700`.
 - **Bounded protocol.** Requests are capped at 1 MiB, must be UTF-8, and must arrive within 5 s in total, so sending one byte at a time doesn't help. Idle connections can't pin threads, and error replies always reach the client.
 - **No fd leaks.** Every descriptor is close-on-exec. A program sees exactly stdin, stdout and stderr on its own PTY: never another session's terminal, the socket, or a log file.
-- **Real isolation per session.** Each program leads its own session with its own controlling terminal. `kill` takes down its descendants, plus orphans that were reparented away but kept the session id.
+- **Real isolation per session.** Each program leads its own session with its own controlling terminal, and every descriptor above stdio is closed before it starts. `kill` stops the leader, then rescans `/proc` until no live member remains: descendants, reparented orphans that kept the session id, and children that ignore SIGHUP.
 - **Terminal output can't attack the reader.** `screen`, `history` and window titles never contain control characters. C1 controls (`U+009B` is CSI on some terminals) and bidi overrides ("Trojan Source") are dropped, so printing `xumux screen` is safe.
 - **Hostile programs can't stall xumux.** Query floods, output floods, raw `/dev/urandom`, unread input and stalled viewers are all tested. Pending input is capped at 4 MiB per session.
-- **Safe logging.** `log` opens only regular files, non-blocking, with mode `0600`. A FIFO with no reader fails right away instead of hanging the session.
+- **Safe logging.** `log` opens only regular files, never through a symlink, non-blocking, with mode `0600`. A FIFO with no reader fails right away instead of hanging the session.
 
-**Found and fixed during the audits:** 29 issues, 13 of them security-relevant. They include a reply-flood deadlock in raw mode, a writer thread leaked when a program stopped reading, slow-loris requests, a `/tmp` socket hijack, a group-writable socket window under `umask 002`, unbounded queued input, escape injection through `screen`, stalled viewers slowing a session, and `log` hanging on a FIFO. Each one now has a regression test.
+**Found and fixed during the audits:** 36 issues, 18 of them security-relevant. The last seven came from an independent audit by a second model whose probes now live in [`tests/audit_probes.rs`](tests/audit_probes.rs): descriptors inherited from the daemon's parent reached sessions; `kill` missed SIGHUP-ignoring children forked during its single `/proc` scan (it now stops the leader and rescans); a program's self-chosen `comm` could carry escape codes into `info`/`settle`; `log` followed symlinks; rejected connections past the client cap each spawned an uncounted thread; U+061C reached `screen`; and `poll`'s `nfds` was declared `u64`, wrong on 32-bit targets. They include a reply-flood deadlock in raw mode, a writer thread leaked when a program stopped reading, slow-loris requests, a `/tmp` socket hijack, a group-writable socket window under `umask 002`, unbounded queued input, escape injection through `screen`, stalled viewers slowing a session, and `log` hanging on a FIFO. Each one now has a regression test.
 
 ## Zero dependencies, in detail
 
-The crate is built with `#![deny(unsafe_code)]`. The one exemption is the `sys` module, where 11 single-call `unsafe` blocks wrap the 7 libc functions std has no safe API for: `ioctl` (PTY unlock, window size, controlling terminal), `setsid`, `kill`, `poll`, and `tcgetattr`/`tcsetattr`/`cfmakeraw` for `attach`'s raw mode. Clippy enforces one call per block and a `SAFETY` comment on each. Anything that *can* be done without a syscall is: the uid is read from `/proc/self/status`, the PTY number from `/proc/self/fdinfo`, and non-blocking mode is set through `OpenOptions`. `kill` refuses pid 0, pid 1 and anything that would become negative, because those values target whole process groups. Everything else is safe Rust:
+The crate is built with `#![deny(unsafe_code)]`. The one exemption is the `sys` module, where 13 single-call `unsafe` blocks wrap the 9 libc functions std has no safe API for: `ioctl` (PTY unlock, window size, controlling terminal), `setsid`, `kill`, `poll`, `close`/`close_range` (so a session never inherits a descriptor from the daemon's parent), and `tcgetattr`/`tcsetattr`/`cfmakeraw` for `attach`'s raw mode. Clippy enforces one call per block and a `SAFETY` comment on each. Anything that *can* be done without a syscall is: the uid is read from `/proc/self/status`, the PTY number from `/proc/self/fdinfo`, and non-blocking mode is set through `OpenOptions`. `kill` refuses pid 0, pid 1 and anything that would become negative, because those values target whole process groups. Everything else is safe Rust:
 
 - **PTYs** are opened through `/dev/ptmx` with std's `OpenOptions`, and processes are managed with std's `Command`/`Child`.
 - **The terminal emulator** handles cursor movement, erase, insert/delete, scroll regions, the alternate screen, UTF-8 and double-width characters, window titles, 10,000 lines of scrollback, and answers cursor-position and device-attribute queries. It has unit tests and a randomized stress test, because a panic would take the daemon down.
@@ -152,7 +152,7 @@ The cost is that this code is ours to maintain instead of borrowed. That's the t
 ## Tests
 
 ```sh
-cargo test --release          # 111 tests: unit, security, commands, swarm
+cargo test --release          # 119 tests: unit, security, commands, swarm, audit probes
 cargo test                    # the same in debug, with overflow checks
 ```
 
@@ -162,6 +162,7 @@ cargo test                    # the same in debug, with overflow checks
 | [`security.rs`](tests/security.rs) | 34 | socket and directory checks, protocol abuse, isolation, hostile programs |
 | [`commands.rs`](tests/commands.rs) | 52 | every command and its errors, through the socket and the real CLI; `run`/`settle`/`wait-exit` on shells, a REPL and a TUI; closed pipes, pruning, edge cases |
 | [`swarm.rs`](tests/swarm.rs) | 8 | 200 concurrent sessions, 32 clients × 250 mixed commands, 300 spawn/kill cycles with leak checks, parallel floods, 20 viewers, resize storms |
+| [`audit_probes.rs`](tests/audit_probes.rs) | 8 | reproductions from an independent audit: inherited fds, fork-loop orphans, comm injection, symlinked logs, busy-thread growth, bidi marks, oversize requests, fd release |
 
 Each test runs its own daemon on its own private socket.
 

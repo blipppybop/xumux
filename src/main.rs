@@ -104,6 +104,7 @@ const USER_HZ: f64 = 100.0; // /proc reports CPU time in USER_HZ, fixed at 100 o
 const DETACH_KEY: u8 = 0x1d; // Ctrl-]
 const DEFAULT_IDLE_MS: u64 = 300; // "quiet" for run/settle
 const MAX_CLIENTS: usize = 512; // concurrent client connections (each holds a thread)
+const MAX_REJECTS: usize = 6; // threads delivering "busy" at once; beyond that, drop
 const MAX_DEAD: usize = 256; // exited sessions kept for reading; oldest are pruned
 const ATTACH_INPUT_WAIT: Duration = Duration::from_secs(2); // typing into a hung program
 const GUIDE: &str = include_str!("../AGENTS.md");
@@ -202,6 +203,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 static CLIENTS: AtomicUsize = AtomicUsize::new(0);
+static REJECTS: AtomicUsize = AtomicUsize::new(0);
 
 static SOCKET: OnceLock<PathBuf> = OnceLock::new();
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -382,6 +384,9 @@ fn attach(args: &[String]) {
 // ---------------------------------------------------------------- server
 
 fn serve() {
+    // Nothing the parent left open may reach a session's program (finding:
+    // inherited non-cloexec descriptors were visible inside sessions).
+    sys::close_from(3).unwrap_or_else(|e| die(format!("cannot close inherited descriptors: {e}")));
     let path = sock_path();
     let listener = match UnixListener::bind(&path) {
         Ok(l) => l,
@@ -409,8 +414,21 @@ fn serve() {
         if CLIENTS.fetch_add(1, Ordering::AcqRel) >= MAX_CLIENTS {
             CLIENTS.fetch_sub(1, Ordering::AcqRel);
             // Off the accept thread: the reply is only delivered once the
-            // request bytes are drained (see finish_reply).
-            thread::spawn(move || finish_reply(&stream, "ERR busy: too many clients\n"));
+            // request bytes are drained (see finish_reply). Those threads are
+            // bounded too; past MAX_REJECTS the connection is simply dropped.
+            if REJECTS.fetch_add(1, Ordering::AcqRel) < MAX_REJECTS {
+                thread::spawn(move || {
+                    // A short drain keeps the slot turning over during a flood.
+                    finish_reply(
+                        &stream,
+                        "ERR busy: too many clients\n",
+                        Duration::from_millis(50),
+                    );
+                    REJECTS.fetch_sub(1, Ordering::AcqRel);
+                });
+            } else {
+                REJECTS.fetch_sub(1, Ordering::AcqRel);
+            }
             continue;
         }
         let sessions = sessions.clone();
@@ -445,7 +463,7 @@ fn handle(stream: UnixStream, sessions: &Sessions) {
         Err(e) => format!("ERR {e}\n"),
     };
     if request.is_err() {
-        finish_reply(&stream, &reply);
+        finish_reply(&stream, &reply, Duration::from_secs(1));
     } else {
         let _ = (&stream).write_all(reply.as_bytes());
     }
@@ -460,10 +478,10 @@ fn handle(stream: UnixStream, sessions: &Sessions) {
 /// Send a reply to a client whose request was not fully consumed. Closing a
 /// Unix socket with unread input makes Linux reset the connection, which would
 /// destroy the reply before the client reads it, so drain briefly first.
-fn finish_reply(stream: &UnixStream, reply: &str) {
+fn finish_reply(stream: &UnixStream, reply: &str, drain: Duration) {
     let _ = (&*stream).write_all(reply.as_bytes());
     let _ = stream.shutdown(Shutdown::Write);
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+    let _ = stream.set_read_timeout(Some(drain));
     let _ = io::copy(&mut stream.take(16 << 20), &mut io::sink());
 }
 
@@ -590,7 +608,11 @@ fn activity(leader: u32) -> Option<Activity> {
     let tpgid: i64 = f.get(5)?.parse().ok()?;
     let job = (tpgid > 0 && tpgid != i64::from(leader)).then(|| {
         let comm = fs::read_to_string(format!("/proc/{tpgid}/comm")).unwrap_or_default();
-        (tpgid as u32, comm.trim().to_string())
+        // A program picks its own comm: keep printable text only.
+        (
+            tpgid as u32,
+            comm.trim().chars().filter(|&c| width(c) > 0).collect(),
+        )
     });
     Some(Activity { running, job })
 }
@@ -639,19 +661,29 @@ fn resize_session(s: &Session, rows: u16, cols: u16) -> Result<(), String> {
 fn kill_session(s: &Session) {
     let mut child = lock(&s.child);
     let alive = matches!(child.try_wait(), Ok(None));
-    let all = procs();
-    let mut doomed: Vec<u32> = all
-        .iter()
-        .filter(|p| p.sid == s.pid)
-        .map(|p| p.pid)
-        .collect();
     if alive {
-        doomed.extend(tree_of(&all, s.pid).into_keys());
+        // Freeze the leader so it cannot fork between our scans.
+        sys::kill_pid(s.pid, sys::SIGSTOP);
     }
-    for pid in doomed {
-        if pid != s.pid {
-            sys::kill_pid(pid);
+    // Scan until a pass finds no live member: children born just before the
+    // stop, and anything that ignores SIGHUP, are caught on a later pass.
+    for _ in 0..20 {
+        let all = procs();
+        let tree = tree_of(&all, s.pid);
+        let doomed: Vec<u32> = all
+            .iter()
+            .filter(|p| {
+                p.pid != s.pid && p.state != 'Z' && (p.sid == s.pid || tree.contains_key(&p.pid))
+            })
+            .map(|p| p.pid)
+            .collect();
+        if doomed.is_empty() {
+            break;
         }
+        for pid in doomed {
+            sys::kill_pid(pid, sys::SIGKILL);
+        }
+        thread::sleep(Duration::from_millis(10));
     }
     if alive {
         let _ = child.kill();
@@ -821,11 +853,12 @@ fn dispatch(line: &str, sessions: &Sessions) -> Result<String, String> {
                 return Err("log path must be absolute".into());
             }
             // O_NONBLOCK: opening a FIFO nobody reads must fail, not hang.
+            // O_NOFOLLOW: never append session output through a symlink.
             let f = OpenOptions::new()
                 .append(true)
                 .create(true)
                 .mode(0o600)
-                .custom_flags(sys::O_NONBLOCK)
+                .custom_flags(sys::O_NONBLOCK | sys::O_NOFOLLOW)
                 .open(&path)
                 .map_err(|e| format!("{}: {e}", path.display()))?;
             if !f.metadata().map_err(err)?.is_file() {
@@ -964,6 +997,10 @@ fn pty_exec(args: &[String]) -> ! {
     if let Err(e) = sys::make_controlling_tty() {
         die(format!("cannot take the terminal: {e}"));
     }
+    // stdio is the PTY; anything above it belongs to the daemon, not the program.
+    if let Err(e) = sys::close_from(3) {
+        die(format!("cannot close inherited descriptors: {e}"));
+    }
     let e = Command::new("/bin/sh")
         .arg("-c")
         .arg(format!("exec {command}"))
@@ -1096,6 +1133,7 @@ fn spawn(name: &str, command: &str, sessions: &Sessions) -> Result<String, Strin
     let pid = child.id();
     let mut map = lock(sessions);
     if map.contains_key(name) {
+        drop(map);
         let _ = child.kill();
         let _ = child.wait();
         return Err(format!("session '{name}' already exists"));
@@ -1254,7 +1292,7 @@ fn unescape(s: &str) -> Result<Vec<u8>, String> {
 
 #[allow(unsafe_code)]
 mod sys {
-    use std::ffi::{c_int, c_ulong, c_void};
+    use std::ffi::{c_int, c_uint, c_ulong, c_void};
     use std::io;
     use std::os::fd::AsRawFd;
 
@@ -1262,7 +1300,9 @@ mod sys {
         fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
         fn setsid() -> c_int;
         fn kill(pid: c_int, sig: c_int) -> c_int;
-        fn poll(fds: *mut PollFd, nfds: u64, timeout_ms: c_int) -> c_int;
+        fn close(fd: c_int) -> c_int;
+        fn close_range(first: c_uint, last: c_uint, flags: c_int) -> c_int;
+        fn poll(fds: *mut PollFd, nfds: c_ulong, timeout_ms: c_int) -> c_int;
         fn tcgetattr(fd: c_int, termios: *mut c_void) -> c_int;
         fn tcsetattr(fd: c_int, action: c_int, termios: *const c_void) -> c_int;
         fn cfmakeraw(termios: *mut c_void);
@@ -1271,13 +1311,15 @@ mod sys {
     // <asm-generic/ioctls.h>, <asm-generic/fcntl.h>, <asm-generic/poll.h>
     pub const O_NOCTTY: c_int = 0o400;
     pub const O_NONBLOCK: c_int = 0o4000;
+    pub const O_NOFOLLOW: c_int = 0o400000;
     pub const POLLIN: i16 = 0x1;
     pub const POLLOUT: i16 = 0x4;
     const TIOCSCTTY: c_ulong = 0x540E;
     const TIOCGWINSZ: c_ulong = 0x5413;
     const TIOCSWINSZ: c_ulong = 0x5414;
     const TIOCSPTLCK: c_ulong = 0x4004_5431; // _IOW('T', 0x31, int)
-    const SIGKILL: c_int = 9;
+    pub const SIGKILL: c_int = 9;
+    pub const SIGSTOP: c_int = 19;
     const TCSANOW: c_int = 0;
 
     #[repr(C)]
@@ -1349,13 +1391,33 @@ mod sys {
         check(unsafe { ioctl(0, TIOCSCTTY, 0 as c_int) })
     }
 
-    /// SIGKILL one process. Refuses pid 0, 1 and anything that would wrap to a
+    /// Signal one process. Refuses pid 0, 1 and anything that would wrap to a
     /// negative pid, since kill(0|-1|-n) targets whole process groups.
-    pub fn kill_pid(pid: u32) {
+    pub fn kill_pid(pid: u32, sig: c_int) {
         if let Ok(p @ 2..) = c_int::try_from(pid) {
             // SAFETY: integer arguments only, pid checked to be >= 2.
-            unsafe { kill(p, SIGKILL) };
+            unsafe { kill(p, sig) };
         }
+    }
+
+    /// Close every descriptor from `first` up. Linux 5.9+ has close_range;
+    /// older kernels fall back to closing each entry of /proc/self/fd.
+    pub fn close_from(first: u32) -> io::Result<()> {
+        // SAFETY: integer arguments only; closing descriptors we do not use.
+        if unsafe { close_range(first, u32::MAX, 0) } == 0 {
+            return Ok(());
+        }
+        let fds: Vec<c_int> = std::fs::read_dir("/proc/self/fd")?
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse().ok())
+            .filter(|&fd| fd >= first as c_int)
+            .collect();
+        for fd in fds {
+            // SAFETY: closing a descriptor by number; the read_dir handle itself
+            // is already dropped, and nothing above `first` is ours to keep.
+            unsafe { close(fd) };
+        }
+        Ok(())
     }
 
     /// Wait until `f` is ready for `events` (or hung up), up to `timeout_ms`
@@ -1486,12 +1548,15 @@ fn width(c: char) -> usize {
         // combining marks, zero-width chars, and bidi controls (U+202A-202E,
         // U+2066-2069: "Trojan Source" reordering) are dropped too
         0x300..=0x36F
+        | 0x061C
+        | 0x180E
         | 0x200B..=0x200F
         | 0x2028..=0x202E
         | 0x2060..=0x206F
         | 0x20D0..=0x20FF
         | 0xFE00..=0xFE0F
-        | 0xFEFF => 0,
+        | 0xFEFF
+        | 0xFFF9..=0xFFFB => 0,
         0x1100..=0x115F
         | 0x2E80..=0x303E
         | 0x3041..=0x4DBF
@@ -2024,7 +2089,8 @@ struct Proc {
     pid: u32,
     ppid: u32,
     sid: u32,
-    ticks: u64, // utime + stime
+    state: char, // R, S, D, Z, ...
+    ticks: u64,  // utime + stime
 }
 
 /// One pass over /proc.
@@ -2050,6 +2116,7 @@ fn procs() -> Vec<Proc> {
                 pid,
                 ppid: ppid as u32,
                 sid: sid as u32,
+                state: f.first().and_then(|v| v.chars().next()).unwrap_or('?'),
                 ticks: u + st,
             });
         }
