@@ -2,6 +2,7 @@
 name = "xumux"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "A lean local terminal multiplexer: spawn, drive and monitor programs in PTYs over a Unix socket"
 license = "MIT"
 repository = "https://github.com/blipppybop/xumux"
@@ -9,8 +10,6 @@ keywords = ["pty", "terminal", "multiplexer", "tmux", "automation"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-portable-pty = "0.9.0"
-vt100 = "0.18.1"
 
 [profile.release]
 opt-level = 3
