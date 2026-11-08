@@ -124,7 +124,7 @@ Status values: `running`, `exited(N)`, `killed(sig N)`. Names are 1–64 charact
 3. **`wait` also sees what you typed.** `xumux send sh 'make; echo DONE\r'` followed by `wait sh 60000 DONE` matches the typed command right away. Make the marker something only the output contains: `echo DONE-$((1+1))`, then wait for `DONE-2`. Or just use `run` or `wait-exit`.
 4. **In a shell, `run` knows when a command is still running**, even a silent one: it waits for the prompt to come back. In a program that isn't a shell (a REPL, a TUI, an agent CLI), `quiet` only means output paused. For replies that pause, use `settle NAME MS 3000` or wait for a known text.
 5. **Keep your context small.** Prefer `run` (new output only) and `history NAME 20` over full `screen` or `history` dumps.
-6. **Never `attach` from a tool call.** It's interactive and waits for a keyboard. It's for humans.
+6. **Never `attach` from a tool call.** It's interactive and waits for a keyboard. It's for humans. A person attached can press `Ctrl-^` to page that session's history (`q` or `Ctrl-^` returns) and `Ctrl-]` to detach. Keys pressed in view mode are not typed into the program.
 7. **Check before you assume.** `xumux list` shows whether a session is still `running` or has `exited(N)`.
 8. **Clean up.** Kill the sessions you created when you're done. Exited sessions stay readable until killed; only the 256 most recent are kept.
 
@@ -140,3 +140,18 @@ Status values: `running`, `exited(N)`, `killed(sig N)`. Names are 1–64 charact
 | `input queue full ...` | the program isn't reading input (busy or hung); try `keys NAME C-c` |
 | `busy: too many clients` | more than 512 connections open at once; retry after a moment |
 | `internal error ...` | a bug in xumux; the session survives, the daemon keeps running |
+
+## 6. A person attaching
+
+`xumux attach NAME` is for someone at a keyboard, not for a tool call.
+
+| Key | Does |
+|---|---|
+| `Ctrl-]` | detach; the program keeps running |
+| `Ctrl-^` | view mode: page the session's scrollback and screen |
+| `PgUp` / `PgDn`, `Up` / `Down`, `j` / `k` | move a page or a line |
+| `Home` / `End`, `g` / `G` | top or bottom of the history |
+| `/text` then Enter | jump to the next line containing `text` |
+| `q` or `Ctrl-^` | leave view mode; the live screen is painted again |
+
+View mode asks the daemon for `history` and draws the pages itself. It does not use the host terminal's scrollback, so it still works when the program has turned on mouse reporting or the alternate screen. While it is open, mouse reporting and bracketed paste are turned off on the host; they are turned back on afterwards if the program had set them. Output the program prints during view mode is kept and shown again on return.

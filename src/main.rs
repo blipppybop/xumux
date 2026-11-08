@@ -5,7 +5,9 @@
 //!
 //! Wire protocol: one request line in, `OK\n<body>` or `ERR <msg>\n` out, then
 //! close. `attach` is the exception: after `OK\n` the connection becomes a raw
-//! bidirectional stream (program output out, keystrokes in).
+//! bidirectional stream (program output out, keystrokes in). Byte 0x1d
+//! (`Ctrl-]`) detaches. Byte 0x1e (`Ctrl-^`) is handled in the client: it
+//! pages `history` and never reaches the program.
 
 // `unsafe` is a compile error everywhere except the `sys` module, and every
 // unsafe block there must carry a SAFETY comment.
@@ -80,7 +82,8 @@ output
   stats NAME                  CPU % and RSS of the session's process tree
 
 terminal
-  attach NAME                 interactive: type into the session; Ctrl-] detaches
+  attach NAME                 interactive: type into the session; Ctrl-] detaches,
+                              Ctrl-^ pages the session's history
   resize NAME ROWS COLS       resize the PTY (1-1000 each)
 
 socket: $XUMUX_SOCK, else $XDG_RUNTIME_DIR/xumux.sock, else /tmp/xumux-$UID/xumux.sock
@@ -102,6 +105,11 @@ const WATCH_LAG: usize = 8 << 20; // output bytes an attached client may lag beh
 const WATCH_QUEUE: usize = 1 << 16; // hard cap on queued chunks (lag is bounded by bytes)
 const USER_HZ: f64 = 100.0; // /proc reports CPU time in USER_HZ, fixed at 100 on Linux
 const DETACH_KEY: u8 = 0x1d; // Ctrl-]
+const VIEW_KEY: u8 = 0x1e; // Ctrl-^  toggles history view mode
+const VIEW_BUFFER: usize = 1 << 20; // live output kept while viewing; oldest is dropped
+/// Host mouse reporting off for the whole time view mode owns the keyboard.
+const MOUSE_OFF: &str = "\x1b[?1000;1002;1003;1006l";
+const PASTE_OFF: &str = "\x1b[?2004l";
 const DEFAULT_IDLE_MS: u64 = 300; // "quiet" for run/settle
 const MAX_CLIENTS: usize = 512; // concurrent client connections (each holds a thread)
 const MAX_REJECTS: usize = 6; // threads delivering "busy" at once; beyond that, drop
@@ -344,41 +352,593 @@ fn attach(args: &[String]) {
     }
     let _ = write!(
         io::stderr(),
-        "[xumux: attached to {name}; Ctrl-] detaches]\r\n"
+        "[xumux: attached to {name}; Ctrl-] detaches, Ctrl-^ views history]\r\n"
     );
+    // A pipe has no size: the session stays at the daemon default, and so does
+    // the mirror we keep in order to repaint when view mode ends.
+    let (term_rows, term_cols) = if rows == 0 {
+        (ROWS as usize, COLS as usize)
+    } else {
+        (rows as usize, cols as usize)
+    };
     let raw = sys::RawMode::enter(&io::stdin()); // restored on drop
-    let mut to_server = stream.try_clone().unwrap_or_else(|e| die(e));
-    thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        let mut stdin = io::stdin().lock();
-        while let Ok(n @ 1..) = stdin.read(&mut buf) {
-            let chunk = &buf[..n];
-            if let Some(i) = chunk.iter().position(|&b| b == DETACH_KEY) {
-                // The daemon sees the detach key and lets go; we stop reading.
-                let _ = to_server.write_all(&chunk[..=i]);
-                let _ = to_server.shutdown(Shutdown::Both);
-                return;
-            }
-            if to_server.write_all(chunk).is_err() {
-                return;
-            }
-        }
-        // stdin ended (e.g. piped input): keep showing output until the session
-        // ends. Don't half-close: the daemon reads end-of-input as "client gone".
+    let shared = Arc::new(Shared {
+        // Lock `out` before `live`.
+        out: Mutex::new(io::stdout()),
+        live: Mutex::new(Live {
+            term: Term::new(term_rows, term_cols),
+            viewing: false,
+            entry_redraw: String::new(),
+            spill: Spill::default(),
+        }),
     });
-    let mut stdout = io::stdout().lock();
+    let to_server = stream.try_clone().unwrap_or_else(|e| die(e));
+    let input = shared.clone();
+    let session = name.clone();
+    thread::spawn(move || stdin_loop(to_server, input, session, term_rows, term_cols));
     let mut buf = [0u8; 16384];
     while let Ok(n @ 1..) = stream.read(&mut buf) {
-        if stdout
-            .write_all(&buf[..n])
-            .and_then(|_| stdout.flush())
-            .is_err()
-        {
+        let chunk = &buf[..n];
+        let mut out = lock(&shared.out);
+        let mut live = lock(&shared.live);
+        // Same rule as the daemon: a panic in the emulator drops this screen
+        // and keeps the attachment.
+        if panic::catch_unwind(AssertUnwindSafe(|| live.term.feed(chunk))).is_err() {
+            let (r, c) = (live.term.rows, live.term.cols);
+            live.term = Term::new(r, c);
+        }
+        if live.viewing {
+            live.spill.push(chunk);
+        } else if out.write_all(chunk).and_then(|_| out.flush()).is_err() {
             break;
         }
     }
+    {
+        let mut out = lock(&shared.out);
+        let mut live = lock(&shared.live);
+        if live.viewing {
+            restore_live(&mut *out, &mut live);
+        }
+    }
     drop(raw);
-    let _ = stdout.write_all(b"\x1b[0m\r\n[xumux: detached]\r\n");
+    let _ = lock(&shared.out).write_all(b"\x1b[0m\r\n[xumux: detached]\r\n");
+}
+
+/// Output held back while view mode is drawing over the terminal.
+#[derive(Default)]
+struct Spill {
+    chunks: VecDeque<Vec<u8>>,
+    bytes: usize,
+    dropped: u64,
+}
+
+impl Spill {
+    fn push(&mut self, chunk: &[u8]) {
+        if chunk.is_empty() {
+            return;
+        }
+        if chunk.len() > VIEW_BUFFER {
+            self.dropped += chunk.len() as u64;
+            return;
+        }
+        while self.bytes + chunk.len() > VIEW_BUFFER {
+            let Some(old) = self.chunks.pop_front() else {
+                break;
+            };
+            self.bytes -= old.len();
+            self.dropped += old.len() as u64;
+        }
+        self.bytes += chunk.len();
+        self.chunks.push_back(chunk.to_vec());
+    }
+
+    fn take_bytes(&mut self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.bytes);
+        for c in self.chunks.drain(..) {
+            out.extend_from_slice(&c);
+        }
+        self.bytes = 0;
+        out
+    }
+
+    fn clear(&mut self) {
+        self.chunks.clear();
+        self.bytes = 0;
+        self.dropped = 0;
+    }
+}
+
+/// Client-side mirror of the session, plus bytes that arrived during view mode.
+struct Live {
+    term: Term,
+    viewing: bool,
+    /// `Term::redraw` captured as view mode starts, before `spill` is applied.
+    entry_redraw: String,
+    spill: Spill,
+}
+
+struct Shared {
+    out: Mutex<io::Stdout>,
+    live: Mutex<Live>,
+}
+
+/// One key from the view-mode parser.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Act {
+    Byte(u8),
+    Up,
+    Down,
+    PgUp,
+    PgDn,
+    Home,
+    End,
+    Esc,
+    View,
+    Detach,
+}
+
+#[derive(Default)]
+struct Keys {
+    buf: Vec<u8>,
+    ready: VecDeque<Act>,
+}
+
+impl Keys {
+    fn clear(&mut self) {
+        self.buf.clear();
+        self.ready.clear();
+    }
+
+    fn pop(&mut self) -> Option<Act> {
+        self.ready.pop_front()
+    }
+
+    fn feed_byte(&mut self, b: u8) {
+        if b == DETACH_KEY || b == VIEW_KEY {
+            self.buf.clear();
+            self.ready.push_back(if b == DETACH_KEY {
+                Act::Detach
+            } else {
+                Act::View
+            });
+            return;
+        }
+        if self.buf.is_empty() && b != 0x1b {
+            self.ready.push_back(Act::Byte(b));
+            return;
+        }
+        self.buf.push(b);
+        if self.buf.len() == 1 {
+            return; // lone ESC: the next byte decides
+        }
+        let second = self.buf[1];
+        if self.buf.len() == 2 && second != b'[' && second != b'O' {
+            let rest = second;
+            self.buf.clear();
+            self.ready.push_back(Act::Esc);
+            self.feed_byte(rest);
+            return;
+        }
+        if second == b'O' && self.buf.len() == 3 {
+            let act = match self.buf[2] {
+                b'A' => Some(Act::Up),
+                b'B' => Some(Act::Down),
+                b'H' => Some(Act::Home),
+                b'F' => Some(Act::End),
+                _ => None,
+            };
+            self.buf.clear();
+            if let Some(act) = act {
+                self.ready.push_back(act);
+            }
+            return;
+        }
+        // A final byte is only meaningful once a parameter byte has had room
+        // to exist; `ESC [` alone is not a finished sequence (`[` is 0x5b).
+        if second == b'[' && self.buf.len() >= 3 {
+            let last = *self.buf.last().unwrap_or(&0);
+            if (0x40..=0x7e).contains(&last) {
+                if let Some(act) = csi_key(&self.buf) {
+                    self.ready.push_back(act);
+                }
+                self.buf.clear();
+            } else if self.buf.len() > 32 {
+                self.buf.clear();
+            }
+        }
+    }
+}
+
+/// `buf` is `ESC [` params final.
+fn csi_key(buf: &[u8]) -> Option<Act> {
+    let last = *buf.last()?;
+    let params = &buf[2..buf.len() - 1];
+    let mut n = 0usize;
+    let mut saw = false;
+    for &c in params {
+        if c.is_ascii_digit() {
+            saw = true;
+            n = n.saturating_mul(10).saturating_add((c - b'0') as usize);
+        } else {
+            break;
+        }
+    }
+    Some(match last {
+        b'A' => Act::Up,
+        b'B' => Act::Down,
+        b'H' => Act::Home,
+        b'F' => Act::End,
+        b'~' if saw => match n {
+            5 => Act::PgUp,
+            6 => Act::PgDn,
+            1 | 7 => Act::Home,
+            4 | 8 => Act::End,
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
+struct View {
+    lines: Vec<String>,
+    top: usize,
+    rows: usize,
+    cols: usize,
+    query: Option<String>,
+    last_query: Option<String>,
+    note: String,
+}
+
+impl View {
+    fn new(lines: Vec<String>, rows: usize, cols: usize) -> Self {
+        let body = rows.saturating_sub(1);
+        let top = lines.len().saturating_sub(body.max(1));
+        View {
+            lines,
+            top,
+            rows,
+            cols,
+            query: None,
+            last_query: None,
+            note: String::new(),
+        }
+    }
+
+    fn body(&self) -> usize {
+        self.rows.saturating_sub(1)
+    }
+
+    fn max_top(&self) -> usize {
+        self.lines.len().saturating_sub(self.body().max(1))
+    }
+
+    fn clamp(&mut self) {
+        self.top = self.top.min(self.max_top());
+    }
+
+    fn scroll(&mut self, delta: isize) {
+        let max = self.max_top() as isize;
+        let next = (self.top as isize + delta).clamp(0, max.max(0));
+        self.top = next as usize;
+        self.note.clear();
+    }
+
+    fn search(&mut self) {
+        let q = self.query.take().unwrap_or_default();
+        if q.is_empty() {
+            self.note.clear();
+            return;
+        }
+        let start = if self.last_query.as_deref() == Some(q.as_str()) {
+            self.top.saturating_add(1)
+        } else {
+            self.top
+        };
+        self.last_query = Some(q.clone());
+        let n = self.lines.len();
+        let hit = (0..n)
+            .map(|off| (start + off) % n)
+            .find(|&i| self.lines[i].contains(&q));
+        match hit {
+            Some(i) => {
+                self.top = i;
+                self.clamp();
+                self.note.clear();
+            }
+            None => self.note = "view: no match; q returns".to_string(),
+        }
+    }
+
+    fn status(&self, dropped: u64) -> String {
+        if !self.note.is_empty() {
+            return fit_cols(&self.note, self.cols);
+        }
+        if let Some(q) = &self.query {
+            return fit_cols(&format!("/{q}"), self.cols);
+        }
+        let n = self.lines.len();
+        let (a, b) = if n == 0 {
+            (0, 0)
+        } else {
+            (self.top + 1, (self.top + self.body()).min(n))
+        };
+        let mut s = format!("view: lines {a}-{b} of {n}; q returns");
+        if dropped > 0 {
+            s.push_str(&format!("; dropped {dropped}"));
+        }
+        fit_cols(&s, self.cols)
+    }
+
+    /// Absolute cursor + erase-to-end-of-line. Never `\x1b[3J` (that erases the
+    /// host's own scrollback) and never a full clear.
+    fn render(&self, dropped: u64) -> String {
+        let mut out = String::new();
+        for i in 0..self.body() {
+            out.push_str(&format!("\x1b[{};1H", i + 1));
+            if let Some(line) = self.lines.get(self.top + i) {
+                out.push_str(&fit_cols(line, self.cols));
+            }
+            out.push_str("\x1b[K");
+        }
+        let row = self.rows.max(1);
+        out.push_str(&format!("\x1b[{row};1H"));
+        out.push_str(&self.status(dropped));
+        out.push_str("\x1b[K");
+        out
+    }
+}
+
+fn fit_cols(s: &str, cols: usize) -> String {
+    let mut out = String::new();
+    let mut w = 0usize;
+    for c in s.chars() {
+        let cw = width(c);
+        if cw == 0 {
+            continue;
+        }
+        if w + cw > cols {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Step {
+    Stay,
+    Leave,
+    Detach,
+}
+
+fn apply_view(view: &mut View, act: Act) -> Step {
+    if view.query.is_some() {
+        match act {
+            Act::Detach => return Step::Detach,
+            Act::View => return Step::Leave,
+            Act::Esc => {
+                view.query = None;
+                view.note.clear();
+            }
+            Act::Byte(b'\r') => view.search(),
+            Act::Byte(0x08) | Act::Byte(0x7f) => {
+                if let Some(q) = view.query.as_mut() {
+                    q.pop();
+                }
+            }
+            Act::Byte(b) if b.is_ascii() && !b.is_ascii_control() => {
+                if let Some(q) = view.query.as_mut() {
+                    q.push(b as char);
+                }
+            }
+            _ => {}
+        }
+        return Step::Stay;
+    }
+    let page = view.body().max(1) as isize;
+    match act {
+        Act::Detach => Step::Detach,
+        Act::View | Act::Byte(b'q') => Step::Leave,
+        Act::Byte(b'/') => {
+            view.query = Some(String::new());
+            view.note.clear();
+            Step::Stay
+        }
+        Act::Up | Act::Byte(b'k') => {
+            view.scroll(-1);
+            Step::Stay
+        }
+        Act::Down | Act::Byte(b'j') => {
+            view.scroll(1);
+            Step::Stay
+        }
+        Act::PgUp => {
+            view.scroll(-page);
+            Step::Stay
+        }
+        Act::PgDn => {
+            view.scroll(page);
+            Step::Stay
+        }
+        Act::Home | Act::Byte(b'g') => {
+            view.top = 0;
+            view.note.clear();
+            Step::Stay
+        }
+        Act::End | Act::Byte(b'G') => {
+            view.top = view.max_top();
+            view.note.clear();
+            Step::Stay
+        }
+        _ => Step::Stay,
+    }
+}
+
+fn fetch_history(name: &str) -> Vec<String> {
+    let Ok(mut stream) = UnixStream::connect(sock_path()) else {
+        return Vec::new();
+    };
+    if stream
+        .write_all(format!("history {name}\n").as_bytes())
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let mut reply = String::new();
+    if stream.read_to_string(&mut reply).is_err() {
+        return Vec::new();
+    }
+    let Some(body) = reply.strip_prefix("OK\n") else {
+        return Vec::new();
+    };
+    body.lines().map(str::to_string).collect()
+}
+
+fn draw_view(shared: &Shared, view: &View) {
+    let dropped = lock(&shared.live).spill.dropped;
+    let frame = view.render(dropped);
+    let mut out = lock(&shared.out);
+    let _ = out.write_all(frame.as_bytes());
+    let _ = out.flush();
+}
+
+fn open_view(shared: &Shared, name: &str, rows: usize, cols: usize, view: &mut Option<View>) {
+    {
+        let _out = lock(&shared.out);
+        let mut live = lock(&shared.live);
+        live.viewing = true;
+        live.entry_redraw = live.term.redraw();
+        live.spill.clear();
+    }
+    let v = View::new(fetch_history(name), rows, cols);
+    let frame = v.render(0);
+    {
+        let mut out = lock(&shared.out);
+        let _ = out.write_all(MOUSE_OFF.as_bytes());
+        let _ = out.write_all(PASTE_OFF.as_bytes());
+        let _ = out.write_all(frame.as_bytes());
+        let _ = out.flush();
+    }
+    *view = Some(v);
+}
+
+/// Put the live session back on the host terminal and let output through again.
+fn restore_live(out: &mut impl Write, live: &mut Live) {
+    if !live.viewing {
+        return;
+    }
+    let alt = live.term.main.is_some();
+    if alt {
+        // Enter the alternate screen first so the clear inside `redraw` lands
+        // there. A partial raw tail is not safe to replay (cursor-relative,
+        // and the oldest bytes may have been dropped).
+        let enable = live.term.mode_seq(Some(true));
+        let paint = live.term.redraw();
+        let rest = live.term.mode_seq(Some(false));
+        let _ = out.write_all(enable.as_bytes());
+        let _ = out.write_all(paint.as_bytes());
+        let _ = out.write_all(rest.as_bytes());
+        live.spill.clear();
+    } else if live.spill.dropped == 0 {
+        let paint = std::mem::take(&mut live.entry_redraw);
+        let tail = live.spill.take_bytes();
+        let modes = live.term.mode_string();
+        let _ = out.write_all(paint.as_bytes());
+        let _ = out.write_all(&tail);
+        let _ = out.write_all(modes.as_bytes());
+    } else {
+        // The tail has a hole. The mirror was fed every byte, so paint that.
+        let paint = live.term.redraw();
+        let modes = live.term.mode_string();
+        let _ = out.write_all(paint.as_bytes());
+        let _ = out.write_all(modes.as_bytes());
+        live.spill.clear();
+    }
+    live.viewing = false;
+    let _ = out.flush();
+}
+
+fn end_view(shared: &Shared, view: &mut Option<View>) {
+    if view.is_none() {
+        return;
+    }
+    *view = None;
+    let mut out = lock(&shared.out);
+    let mut live = lock(&shared.live);
+    restore_live(&mut *out, &mut live);
+}
+
+fn stdin_loop(mut server: UnixStream, shared: Arc<Shared>, name: String, rows: usize, cols: usize) {
+    let mut stdin = io::stdin();
+    let mut buf = [0u8; 4096];
+    let mut keys = Keys::default();
+    let mut view: Option<View> = None;
+    loop {
+        let n = match stdin.read(&mut buf) {
+            Ok(n @ 1..) => n,
+            _ => {
+                // stdin ended (piped input): keep showing output until the
+                // session ends. Don't half-close: the daemon reads end-of-input
+                // as "client gone".
+                end_view(&shared, &mut view);
+                return;
+            }
+        };
+        let mut i = 0;
+        while i < n {
+            if view.is_none() {
+                let rest = &buf[i..n];
+                match rest.iter().position(|&b| b == DETACH_KEY || b == VIEW_KEY) {
+                    None => {
+                        if server.write_all(rest).is_err() {
+                            return;
+                        }
+                        break;
+                    }
+                    Some(0) if rest[0] == DETACH_KEY => {
+                        let _ = server.write_all(&[DETACH_KEY]);
+                        let _ = server.shutdown(Shutdown::Both);
+                        return;
+                    }
+                    Some(0) => {
+                        i += 1;
+                        open_view(&shared, &name, rows, cols, &mut view);
+                    }
+                    Some(p) => {
+                        if server.write_all(&rest[..p]).is_err() {
+                            return;
+                        }
+                        i += p;
+                    }
+                }
+            } else {
+                keys.feed_byte(buf[i]);
+                i += 1;
+                let mut dirty = false;
+                while let Some(act) = keys.pop() {
+                    match apply_view(view.as_mut().unwrap(), act) {
+                        Step::Stay => dirty = true,
+                        Step::Leave => {
+                            end_view(&shared, &mut view);
+                            keys.clear();
+                            dirty = false;
+                            break;
+                        }
+                        Step::Detach => {
+                            end_view(&shared, &mut view);
+                            let _ = server.write_all(&[DETACH_KEY]);
+                            let _ = server.shutdown(Shutdown::Both);
+                            return;
+                        }
+                    }
+                }
+                if dirty && let Some(v) = view.as_ref() {
+                    draw_view(&shared, v);
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------- server
@@ -1534,6 +2094,60 @@ struct Term {
     last_output: Instant,
     title: String, // set by OSC 0 / OSC 2
     osc: Vec<u8>,
+    /// DEC private modes the program has set, so a later attach (or a return
+    /// from view mode) can put the host terminal back the way the program left it.
+    modes: Modes,
+}
+
+/// Modes `mode_string` re-emits. Defaults match a fresh xterm: autowrap and a
+/// visible cursor on, everything else off. Turning one off is remembered too;
+/// only the ones that are currently set are written back.
+struct Modes {
+    app_cursor: bool, // 1
+    autowrap: bool,   // 7
+    cursor: bool,     // 25
+    alt_47: bool,
+    alt_1047: bool,
+    alt_1049: bool,
+    mouse_1000: bool,
+    mouse_1002: bool,
+    mouse_1003: bool,
+    mouse_1006: bool,
+    paste: bool, // 2004
+}
+
+impl Modes {
+    fn fresh() -> Self {
+        Modes {
+            app_cursor: false,
+            autowrap: true,
+            cursor: true,
+            alt_47: false,
+            alt_1047: false,
+            alt_1049: false,
+            mouse_1000: false,
+            mouse_1002: false,
+            mouse_1003: false,
+            mouse_1006: false,
+            paste: false,
+        }
+    }
+
+    fn pairs(&self) -> [(u16, bool); 11] {
+        [
+            (1, self.app_cursor),
+            (7, self.autowrap),
+            (25, self.cursor),
+            (47, self.alt_47),
+            (1047, self.alt_1047),
+            (1049, self.alt_1049),
+            (1000, self.mouse_1000),
+            (1002, self.mouse_1002),
+            (1003, self.mouse_1003),
+            (1006, self.mouse_1006),
+            (2004, self.paste),
+        ]
+    }
 }
 
 const HISTORY_LINES: usize = 10_000;
@@ -1598,6 +2212,7 @@ impl Term {
             last_output: Instant::now(),
             title: String::new(),
             osc: Vec::new(),
+            modes: Modes::fresh(),
         }
     }
 
@@ -1635,25 +2250,55 @@ impl Term {
     /// What an attaching terminal receives first: the scrollback and the
     /// screen as ordinary lines (so the viewer's own terminal keeps them in
     /// its scrollback and can scroll up to read the session's past), then
-    /// the screen painted in place, row by row, and the cursor.
+    /// the screen painted in place, row by row, and the cursor. The program's
+    /// set private modes come along too, so a program already in the
+    /// alternate screen with mouse reporting on is attached that way.
+    /// Never uses `\x1b[2J` or `\x1b[3J`: a clear would wipe the lines just
+    /// scrolled up without moving them into the viewer's scrollback.
     fn attach_paint(&self) -> String {
         let mut out = String::from("\x1b[0m\r\n");
         for l in &self.history {
             out += l;
             out += "\r\n";
         }
-        for r in 0..self.rows {
-            out += &self.line(r);
-            if r + 1 < self.rows {
-                out += "\r\n";
+        // The alt screen's grid is not the main transcript. Dumping it as
+        // plain lines would land in the host's main scrollback; the in-place
+        // paint below draws it after the switch instead.
+        if self.main.is_none() {
+            for r in 0..self.rows {
+                out += &self.line(r);
+                if r + 1 < self.rows {
+                    out += "\r\n";
+                }
             }
         }
-        // Repaint absolutely (no clear: a clear would wipe the lines just
-        // scrolled up without moving them into the viewer's scrollback).
+        // Enter the alternate screen before the in-place paint. Emitting the
+        // enter sequence again afterwards would clear the paint on a real
+        // terminal (1049/1047 clear on entry).
+        out += &self.mode_seq(Some(true));
         for r in 0..self.rows {
             out += &format!("\x1b[{};1H{}\x1b[K", r + 1, self.line(r));
         }
         out += &format!("\x1b[{};{}H", self.row + 1, self.col + 1);
+        out += &self.mode_seq(Some(false));
+        out
+    }
+
+    /// CSI private sequences for every tracked mode that is currently set.
+    fn mode_string(&self) -> String {
+        self.mode_seq(None)
+    }
+
+    /// `Some(true)` is only the alternate-screen modes, `Some(false)` is the
+    /// rest, `None` is all of them.
+    fn mode_seq(&self, alt: Option<bool>) -> String {
+        let mut out = String::new();
+        for (m, on) in self.modes.pairs() {
+            let is_alt = matches!(m, 47 | 1047 | 1049);
+            if on && alt.is_none_or(|want| want == is_alt) {
+                out.push_str(&format!("\x1b[?{m}h"));
+            }
+        }
         out
     }
 
@@ -1989,9 +2634,21 @@ impl Term {
     }
 
     fn mode(&mut self, m: usize, on: bool) {
-        if !matches!(m, 47 | 1047 | 1049) {
-            return;
+        match m {
+            1 => self.modes.app_cursor = on,
+            7 => self.modes.autowrap = on,
+            25 => self.modes.cursor = on,
+            1000 => self.modes.mouse_1000 = on,
+            1002 => self.modes.mouse_1002 = on,
+            1003 => self.modes.mouse_1003 = on,
+            1006 => self.modes.mouse_1006 = on,
+            2004 => self.modes.paste = on,
+            47 | 1047 | 1049 => self.alt_mode(m, on),
+            _ => {}
         }
+    }
+
+    fn alt_mode(&mut self, m: usize, on: bool) {
         if on && self.main.is_none() {
             if m == 1049 {
                 self.saved = (self.row, self.col);
@@ -2003,6 +2660,17 @@ impl Term {
             if m == 1049 {
                 self.restore();
             }
+            // Any one of these leaving the alternate screen drops all of them:
+            // the screen itself is no longer the alternate one.
+            self.modes.alt_47 = false;
+            self.modes.alt_1047 = false;
+            self.modes.alt_1049 = false;
+            return;
+        }
+        match m {
+            47 => self.modes.alt_47 = on,
+            1047 => self.modes.alt_1047 = on,
+            _ => self.modes.alt_1049 = on,
         }
     }
 
@@ -2341,6 +3009,132 @@ mod tests {
     }
 
     #[test]
+    fn mode_string_tracks_private_modes() {
+        let defaults = term(2, 4, "").mode_string();
+        assert_eq!(defaults, "\x1b[?7h\x1b[?25h");
+        let t = term(
+            4,
+            8,
+            "\x1b[?1h\x1b[?1000;1002;1006h\x1b[?2004h\x1b[?1049h\x1b[?25l",
+        );
+        assert_eq!(
+            t.mode_string(),
+            "\x1b[?1h\x1b[?7h\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h"
+        );
+        assert!(t.main.is_some(), "1049 enters the alternate screen");
+        let off = term(2, 4, "\x1b[?1000h\x1b[?1003h\x1b[?2004h\x1b[?1000l\x1b[?7l");
+        assert_eq!(off.mode_string(), "\x1b[?25h\x1b[?1003h\x1b[?2004h");
+        let left = term(2, 4, "main\x1b[?1049h\x1b[?47h\x1b[?1049l");
+        assert!(left.main.is_none());
+        assert_eq!(left.mode_string(), "\x1b[?7h\x1b[?25h");
+        assert_eq!(left.contents(), "main");
+        // RIS clears modes and keeps history.
+        let mut reset = term(2, 4, "\x1b[?1000h\x1b[?2004h");
+        reset.feed(b"\x1bc");
+        assert_eq!(reset.mode_string(), "\x1b[?7h\x1b[?25h");
+    }
+
+    #[test]
+    fn attach_paint_round_trips_modes_without_clearing_scrollback() {
+        let mut src = Term::new(4, 10);
+        for i in 0..12 {
+            src.feed(format!("L{i}\r\n").as_bytes());
+        }
+        src.feed(b"\x1b[?1000h\x1b[?2004h");
+        let paint = src.attach_paint();
+        assert!(!paint.contains("\x1b[2J") && !paint.contains("\x1b[3J"));
+        assert!(paint.contains("\x1b[?1000h") && paint.contains("\x1b[?2004h"));
+        let mut dst = Term::new(4, 10);
+        dst.feed(paint.as_bytes());
+        assert_eq!(dst.contents(), src.contents());
+        assert_eq!((dst.row, dst.col), (src.row, src.col));
+        assert_eq!(dst.mode_string(), src.mode_string());
+
+        let alt = term(3, 10, "main\x1b[?1049h\x1b[HALT!\x1b[?1000h");
+        assert!(alt.contents().starts_with("ALT!"), "{}", alt.contents());
+        let paint = alt.attach_paint();
+        let i_alt = paint.find("\x1b[?1049h").expect("alt mode");
+        let i_text = paint.rfind("ALT!").expect("alt text");
+        let i_mouse = paint.find("\x1b[?1000h").expect("mouse");
+        assert!(i_alt < i_text && i_text < i_mouse, "{paint:?}");
+        assert!(!paint.contains("\x1b[3J"));
+        let mut dst = Term::new(3, 6);
+        dst.feed(paint.as_bytes());
+        assert_eq!(dst.contents(), alt.contents());
+        assert_eq!((dst.row, dst.col), (alt.row, alt.col));
+        assert!(dst.main.is_some());
+        assert_eq!(dst.mode_string(), alt.mode_string());
+    }
+
+    #[test]
+    fn view_spill_drops_oldest_and_counts_it() {
+        let mut s = Spill::default();
+        s.push(&[1; 100]);
+        s.push(&[2; 100]);
+        // Cap is 1 MiB; force the bound through a local check by filling past it.
+        let big = vec![3u8; VIEW_BUFFER];
+        s.push(&big);
+        assert!(s.dropped >= 200, "oldest chunks dropped, got {}", s.dropped);
+        assert_eq!(s.bytes, VIEW_BUFFER);
+        assert_eq!(s.chunks.len(), 1);
+        assert_eq!(s.chunks[0][0], 3);
+        let over = vec![9u8; VIEW_BUFFER + 1];
+        s.push(&over);
+        assert!(s.dropped >= VIEW_BUFFER as u64);
+        assert_eq!(s.bytes, VIEW_BUFFER, "an oversize chunk is dropped whole");
+    }
+
+    #[test]
+    fn view_keys_parse_motion_and_toggles() {
+        let mut k = Keys::default();
+        let mut got = Vec::new();
+        for b in b"j\x1b[A\x1b[6~\x1b[H\x1bOF\x1e\x1dq" {
+            k.feed_byte(*b);
+            while let Some(a) = k.pop() {
+                got.push(a);
+            }
+        }
+        // A split escape still completes on the next byte.
+        for b in b"\x1b[5~" {
+            k.feed_byte(*b);
+            while let Some(a) = k.pop() {
+                got.push(a);
+            }
+        }
+        assert_eq!(
+            got,
+            vec![
+                Act::Byte(b'j'),
+                Act::Up,
+                Act::PgDn,
+                Act::Home,
+                Act::End,
+                Act::View,
+                Act::Detach,
+                Act::Byte(b'q'),
+                Act::PgUp,
+            ]
+        );
+    }
+
+    #[test]
+    fn view_search_erases_with_backspace_or_delete() {
+        let mut v = View::new(vec!["alpha".into(), "beta".into()], 3, 20);
+        assert_eq!(apply_view(&mut v, Act::Byte(b'/')), Step::Stay);
+        for b in b"ab" {
+            assert_eq!(apply_view(&mut v, Act::Byte(*b)), Step::Stay);
+        }
+        assert_eq!(v.query.as_deref(), Some("ab"));
+        // `q` is a literal while a search is being typed.
+        assert_eq!(apply_view(&mut v, Act::Byte(b'q')), Step::Stay);
+        assert_eq!(v.query.as_deref(), Some("abq"));
+        assert_eq!(apply_view(&mut v, Act::Byte(0x08)), Step::Stay);
+        assert_eq!(v.query.as_deref(), Some("ab"));
+        assert_eq!(apply_view(&mut v, Act::Byte(0x7f)), Step::Stay);
+        assert_eq!(v.query.as_deref(), Some("a"));
+    }
+
+    #[test]
     fn resize_keeps_content_and_clamps_cursor() {
         let mut t = term(3, 5, "abcde\r\nfghij\x1b[3;5H");
         t.resize(2, 3);
@@ -2401,6 +3195,9 @@ mod tests {
             b"h",
             b"l",
             b"1049",
+            b"1000",
+            b"2004",
+            b"25",
             b"n",
             b"c",
             b"\x1b7",

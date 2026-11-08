@@ -843,10 +843,19 @@ fn attach_replays_scrollback_so_the_terminal_can_scroll_up() {
     // Lines that scrolled off the 24-row screen long ago still reach the
     // attaching terminal, as plain lines it keeps in its own scrollback.
     for n in [1, 2, 3, 50] {
-        assert!(out.contains(&format!("LINE-{n}\r\n")), "LINE-{n} not replayed: {out:?}");
+        assert!(
+            out.contains(&format!("LINE-{n}\r\n")),
+            "LINE-{n} not replayed: {out:?}"
+        );
     }
     // The live screen is then painted in place with the cursor where it is.
     assert!(out.contains("LINE-100"), "screen missing: {out:?}");
-    assert!(!out.contains("\x1b[2J"), "attach must not clear the terminal (loses scrollback)");
-    assert!(out.contains("\x1b[1;1H"), "absolute repaint missing: {out:?}");
+    assert!(
+        !out.contains("\x1b[2J"),
+        "attach must not clear the terminal (loses scrollback)"
+    );
+    assert!(
+        out.contains("\x1b[1;1H"),
+        "absolute repaint missing: {out:?}"
+    );
 }

@@ -4,7 +4,7 @@
 
 ### The zero-dependency terminal multiplexer for programs, scripts and AI agents
 
-`0 dependencies` · `1 Rust file` · `635 KiB binary` · `119 tests` · `Linux` · `MIT`
+`0 dependencies` · `1 Rust file` · `662 KiB binary` · `129 tests` · `Linux` · `MIT`
 
 </div>
 
@@ -26,9 +26,9 @@
 
 |                         | **xumux**                                     | tmux                                     |
 |-------------------------|-----------------------------------------------|------------------------------------------|
-| Source                  | **2,185 lines**, 1 file                       | 114,498 lines, 157 files                 |
+| Source                  | **3,225 lines**, 1 file                       | 114,498 lines, 157 files                 |
 | Dependencies            | **none**                                      | libevent, ncurses (+ utf8proc, jemalloc) |
-| Binary                  | **635 KiB**, statically linked Rust           | plus shared libraries                    |
+| Binary                  | **662 KiB**, statically linked Rust           | plus shared libraries                    |
 | Clean build             | **4.8 s**, offline                            | autotools + library headers              |
 | Idle daemon memory      | **2.5 MiB**                                   |                                          |
 | Built for               | programs and agents (people via `attach`)     | people at a keyboard                     |
@@ -49,7 +49,7 @@ xumux run sh 30000 'cd ~/api && ls'    # type, wait until done, print only the n
 xumux spawn api 'cd ~/api && PORT=8080 exec ./server'
 xumux wait api 10000 'listening || Error'   # block until either text shows up
 xumux stats api                        # CPU and memory of its process tree
-xumux attach api                       # take the keyboard; Ctrl-] detaches
+xumux attach api                       # take the keyboard; Ctrl-] detaches, Ctrl-^ pages history
 ```
 
 **Using it from an AI agent?** Read [`AGENTS.md`](AGENTS.md), or run `xumux guide`: the same text is built into the binary.
@@ -73,7 +73,7 @@ xumux attach api                       # take the keyboard; Ctrl-] detaches
 | `guide` | print the agent guide | *none* |
 | `log NAME PATH\|off` | append raw output to a file | `pipe-pane` |
 | `stats NAME` | CPU % and RSS of the whole process tree | *none* |
-| `attach NAME` | interactive; `Ctrl-]` detaches; any number of viewers | `attach` |
+| `attach NAME` | interactive; `Ctrl-]` detaches, `Ctrl-^` pages history; any number of viewers | `attach` |
 | `resize NAME ROWS COLS` | resize the PTY; the program gets `SIGWINCH` | `resize-window` |
 | `rename NAME NEW` | rename a session | `rename-session` |
 | `kill NAME` | kill the program, its children and its orphans | `kill-session` |
@@ -81,7 +81,7 @@ xumux attach api                       # take the keyboard; Ctrl-] detaches
 
 The working directory and environment come from the command itself: `xumux spawn job 'cd /srv && DEBUG=1 exec ./run'`.
 
-**Deliberately left out:** split panes, window layouts, the status bar, copy mode, key bindings and the config language. Those are tmux's user interface, and your terminal app or window manager already does them. Open `xumux attach` in as many tabs or splits as you like.
+**Deliberately left out:** split panes, window layouts, the status bar, copy mode (select and paste), key bindings and the config language. Those are tmux's user interface, and your terminal app or window manager already does them. `Ctrl-^` during `attach` pages that session's history in the client instead; it does not use the host terminal's scrollback. Open `xumux attach` in as many tabs or splits as you like.
 
 ## Benchmarks
 
@@ -145,22 +145,23 @@ The threat model has two parts: other users on the same machine, and hostile pro
 The crate is built with `#![deny(unsafe_code)]`. The one exemption is the `sys` module, where 13 single-call `unsafe` blocks wrap the 9 libc functions std has no safe API for: `ioctl` (PTY unlock, window size, controlling terminal), `setsid`, `kill`, `poll`, `close`/`close_range` (so a session never inherits a descriptor from the daemon's parent), and `tcgetattr`/`tcsetattr`/`cfmakeraw` for `attach`'s raw mode. Clippy enforces one call per block and a `SAFETY` comment on each. Anything that *can* be done without a syscall is: the uid is read from `/proc/self/status`, the PTY number from `/proc/self/fdinfo`, and non-blocking mode is set through `OpenOptions`. `kill` refuses pid 0, pid 1 and anything that would become negative, because those values target whole process groups. Everything else is safe Rust:
 
 - **PTYs** are opened through `/dev/ptmx` with std's `OpenOptions`, and processes are managed with std's `Command`/`Child`.
-- **The terminal emulator** handles cursor movement, erase, insert/delete, scroll regions, the alternate screen, UTF-8 and double-width characters, window titles, 10,000 lines of scrollback, and answers cursor-position and device-attribute queries. It has unit tests and a randomized stress test, because a panic would take the daemon down.
+- **The terminal emulator** handles cursor movement, erase, insert/delete, scroll regions, the alternate screen, UTF-8 and double-width characters, window titles, 10,000 lines of scrollback, and answers cursor-position and device-attribute queries. It remembers the private modes a program sets (mouse reporting, bracketed paste, the alternate screen, the cursor, autowrap, application cursor keys) and `attach` puts the host terminal into those modes. It has unit tests and a randomized stress test, because a panic would take the daemon down.
 
 The cost is that this code is ours to maintain instead of borrowed. That's the trade: there's nothing to audit but this repository.
 
 ## Tests
 
 ```sh
-cargo test --release          # 119 tests: unit, security, commands, swarm, audit probes
+cargo test --release          # 129 tests: unit, security, commands, swarm, audit probes, view mode
 cargo test                    # the same in debug, with overflow checks
 ```
 
 | Suite | Tests | Covers |
 |---|---|---|
-| unit (`src/main.rs`) | 17 | emulator behavior, sanitizing, name rules, lock recovery, ~900,000-input stress test |
+| unit (`src/main.rs`) | 22 | emulator behavior, private modes, sanitizing, name rules, lock recovery, view-mode keys, ~900,000-input stress test |
 | [`security.rs`](tests/security.rs) | 34 | socket and directory checks, protocol abuse, isolation, hostile programs |
-| [`commands.rs`](tests/commands.rs) | 52 | every command and its errors, through the socket and the real CLI; `run`/`settle`/`wait-exit` on shells, a REPL and a TUI; closed pipes, pruning, edge cases |
+| [`commands.rs`](tests/commands.rs) | 53 | every command and its errors, through the socket and the real CLI; `run`/`settle`/`wait-exit` on shells, a REPL and a TUI; closed pipes, pruning, edge cases |
+| [`view.rs`](tests/view.rs) | 4 | attach view mode: old scrollback, paging, search, return to the live screen, detach, mouse and paste restore, alt screen |
 | [`swarm.rs`](tests/swarm.rs) | 8 | 200 concurrent sessions, 32 clients × 250 mixed commands, 300 spawn/kill cycles with leak checks, parallel floods, 20 viewers, resize storms |
 | [`audit_probes.rs`](tests/audit_probes.rs) | 8 | reproductions from an independent audit: inherited fds, fork-loop orphans, comm injection, symlinked logs, busy-thread growth, bidi marks, oversize requests, fd release |
 
@@ -174,7 +175,7 @@ One line in; `OK\n<body>` or `ERR <message>\n` out; then the connection closes. 
 printf 'list\n' | nc -U "$XDG_RUNTIME_DIR/xumux.sock"
 ```
 
-`attach` is the one exception. After `OK\n` the connection carries a redraw and then raw output, and anything you write back is keystrokes. Byte `0x1d` (`Ctrl-]`) detaches.
+`attach` is the one exception. After `OK\n` the connection carries a redraw and then raw output, and anything you write back is keystrokes. Byte `0x1d` (`Ctrl-]`) detaches. Byte `0x1e` (`Ctrl-^`) never reaches the program: the client pages `history` (a second, ordinary request) and paints it locally.
 
 ## Limitations
 
