@@ -4,7 +4,7 @@
 
 ### The zero-dependency terminal multiplexer for programs, scripts and AI agents
 
-`0 dependencies` · `1 Rust file` · `662 KiB binary` · `129 tests` · `Linux` · `MIT`
+`0 dependencies` · `1 Rust file` · `673 KiB binary` · `136 tests` · `Linux` · `MIT`
 
 </div>
 
@@ -26,9 +26,9 @@
 
 |                         | **xumux**                                     | tmux                                     |
 |-------------------------|-----------------------------------------------|------------------------------------------|
-| Source                  | **3,225 lines**, 1 file                       | 114,498 lines, 157 files                 |
+| Source                  | **3,467 lines**, 1 file                       | 114,498 lines, 157 files                 |
 | Dependencies            | **none**                                      | libevent, ncurses (+ utf8proc, jemalloc) |
-| Binary                  | **662 KiB**, statically linked Rust           | plus shared libraries                    |
+| Binary                  | **673 KiB**, statically linked Rust           | plus shared libraries                    |
 | Clean build             | **4.8 s**, offline                            | autotools + library headers              |
 | Idle daemon memory      | **2.5 MiB**                                   |                                          |
 | Built for               | programs and agents (people via `attach`)     | people at a keyboard                     |
@@ -60,8 +60,8 @@ xumux attach api                       # take the keyboard; Ctrl-] detaches, Ctr
 |---|---|---|
 | `serve` | run the daemon | `start-server` |
 | `spawn NAME COMMAND...` | start a program in a new 40×120 PTY | `new-session -d` |
-| `list` | name, pid, status, command | `list-sessions` |
-| `info NAME` | pid, status, size, cursor, title, alt screen, history, viewers, log | `display -p` |
+| `list` | name, pid, status, command, cwd (tab-separated; cwd is the last column) | `list-sessions` |
+| `info NAME` | pid, status, size, cursor, title, alt screen, history, viewers, log, cwd, cwd_source | `display -p` |
 | `send NAME TEXT` | type text; escapes `\r \n \t \e \\ \xHH` | `send-keys -l` |
 | `keys NAME KEY...` | `Enter Tab Esc BSpace Up Down Left Right Home End PgUp PgDn F1`–`F12 C-x M-x`, or plain text | `send-keys` |
 | `screen NAME` | the visible screen as plain text | `capture-pane -p` |
@@ -73,13 +73,13 @@ xumux attach api                       # take the keyboard; Ctrl-] detaches, Ctr
 | `guide` | print the agent guide | *none* |
 | `log NAME PATH\|off` | append raw output to a file | `pipe-pane` |
 | `stats NAME` | CPU % and RSS of the whole process tree | *none* |
-| `attach NAME` | interactive; `Ctrl-]` detaches, `Ctrl-^` pages history; any number of viewers | `attach` |
+| `attach NAME` | interactive; banner names the session directory; `Ctrl-]` detaches, `Ctrl-^` pages history; any number of viewers | `attach` |
 | `resize NAME ROWS COLS` | resize the PTY; the program gets `SIGWINCH` | `resize-window` |
 | `rename NAME NEW` | rename a session | `rename-session` |
 | `kill NAME` | kill the program, its children and its orphans | `kill-session` |
 | `shutdown` | kill every session and stop the daemon | `kill-server` |
 
-The working directory and environment come from the command itself: `xumux spawn job 'cd /srv && DEBUG=1 exec ./run'`.
+A session starts in the working directory of the `xumux spawn` client. `list` adds that path as a fifth tab-separated column, after the command, and `info` adds `cwd` and `cwd_source` (`client`, or `daemon` when the client could not read its directory and the daemon's directory was used instead). A directory that is not there is refused with `ERR cwd DIR does not exist`. On the spawn request the path is one token, `cwd:` plus percent-encoding (`%HH` for every byte other than `A-Z a-z 0-9 - . _ ~ /`), so a space or a newline cannot split the line. A cwd that is not valid UTF-8 or longer than 4096 bytes is refused. `cwd:-`, or a request with no `cwd:` token, means the daemon's directory. Attach prints `[xumux: attached to NAME in CWD; Ctrl-] detaches, Ctrl-^ views history]` on stderr. Environment variables still come from the command: `xumux spawn job 'DEBUG=1 exec ./run'`.
 
 **Deliberately left out:** split panes, window layouts, the status bar, copy mode (select and paste), key bindings and the config language. Those are tmux's user interface, and your terminal app or window manager already does them. `Ctrl-^` during `attach` pages that session's history in the client instead; it does not use the host terminal's scrollback. Open `xumux attach` in as many tabs or splits as you like.
 
@@ -119,7 +119,7 @@ Two design choices behind these numbers:
 A multiplexer is only useful if it outlives the programs inside it. Design rules, each with a test:
 
 - **A bug never takes the daemon down.** Panics unwind instead of aborting. A panic while handling a request is caught and answered with `ERR internal error`; a panic inside the terminal emulator resets that one session's screen and keeps the session; a poisoned lock is recovered instead of cascading. The emulator is also fuzzed with ~900,000 random inputs so this path should never be needed.
-- **Everything is bounded.** Request size (1 MiB), request time (5 s), pending input per session (4 MiB), viewer lag (8 MiB), concurrent clients (512, then `ERR busy`), exited sessions kept for reading (256, oldest pruned), PTY size (1000×1000), scrollback (10,000 lines), name length (64).
+- **Everything is bounded.** Request size (1 MiB), request time (5 s), pending input per session (4 MiB), viewer lag (8 MiB), concurrent clients (512, then `ERR busy`), exited sessions kept for reading (256, oldest pruned), PTY size (1000×1000), scrollback (10,000 lines), name length (64), cwd path (4096 bytes).
 - **Clients never panic on a closed pipe.** `xumux history s | head -1` exits quietly; a daemon started with stderr closed still runs.
 - **Attach always lets go.** A viewer that disconnects is unregistered right away, even from a silent session, and `Ctrl-]` gets through within 2 s even when pasting into a program that has stopped reading its input.
 - **`run` knows the difference between "quiet" and "done".** It waits for the shell to have no foreground job *and* not be runnable, so a command that is still being forked under heavy load isn't reported finished.
@@ -152,15 +152,15 @@ The cost is that this code is ours to maintain instead of borrowed. That's the t
 ## Tests
 
 ```sh
-cargo test --release          # 129 tests: unit, security, commands, swarm, audit probes, view mode
+cargo test --release          # 136 tests: unit, security, commands, swarm, audit probes, view mode
 cargo test                    # the same in debug, with overflow checks
 ```
 
 | Suite | Tests | Covers |
 |---|---|---|
-| unit (`src/main.rs`) | 22 | emulator behavior, private modes, sanitizing, name rules, lock recovery, view-mode keys, ~900,000-input stress test |
+| unit (`src/main.rs`) | 25 | emulator behavior, private modes, sanitizing, name rules, cwd encoding, lock recovery, view-mode keys, ~900,000-input stress test |
 | [`security.rs`](tests/security.rs) | 34 | socket and directory checks, protocol abuse, isolation, hostile programs |
-| [`commands.rs`](tests/commands.rs) | 53 | every command and its errors, through the socket and the real CLI; `run`/`settle`/`wait-exit` on shells, a REPL and a TUI; closed pipes, pruning, edge cases |
+| [`commands.rs`](tests/commands.rs) | 57 | every command and its errors, through the socket and the real CLI; client cwd in `list`, `info` and the attach banner; `run`/`settle`/`wait-exit` on shells, a REPL and a TUI; closed pipes, pruning, edge cases |
 | [`view.rs`](tests/view.rs) | 4 | attach view mode: old scrollback, paging, search, return to the live screen, detach, mouse and paste restore, alt screen |
 | [`swarm.rs`](tests/swarm.rs) | 8 | 200 concurrent sessions, 32 clients × 250 mixed commands, 300 spawn/kill cycles with leak checks, parallel floods, 20 viewers, resize storms |
 | [`audit_probes.rs`](tests/audit_probes.rs) | 8 | reproductions from an independent audit: inherited fds, fork-loop orphans, comm injection, symlinked logs, busy-thread growth, bidi marks, oversize requests, fd release |
@@ -175,7 +175,9 @@ One line in; `OK\n<body>` or `ERR <message>\n` out; then the connection closes. 
 printf 'list\n' | nc -U "$XDG_RUNTIME_DIR/xumux.sock"
 ```
 
-`attach` is the one exception. After `OK\n` the connection carries a redraw and then raw output, and anything you write back is keystrokes. Byte `0x1d` (`Ctrl-]`) detaches. Byte `0x1e` (`Ctrl-^`) never reaches the program: the client pages `history` (a second, ordinary request) and paints it locally.
+`spawn NAME cwd:<percent-encoded-path> COMMAND` carries the client's absolute working directory. The decoded path must be valid UTF-8, absolute, and at most 4096 bytes. `cwd:-`, or no `cwd:` token, uses the daemon's directory and `info` reports `cwd_source` as `daemon`.
+
+`attach` is the one exception. After `OK\n` the connection carries a redraw and then raw output, and anything you write back is keystrokes. Byte `0x1d` (`Ctrl-]`) detaches. Byte `0x1e` (`Ctrl-^`) never reaches the program: the client pages `history` (a second, ordinary request) and paints it locally. The client prints `[xumux: attached to NAME in CWD; Ctrl-] detaches, Ctrl-^ views history]` before that stream.
 
 ## Limitations
 

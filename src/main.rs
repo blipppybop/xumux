@@ -4,7 +4,9 @@
 //! Every other subcommand is a client that sends one line and prints the reply.
 //!
 //! Wire protocol: one request line in, `OK\n<body>` or `ERR <msg>\n` out, then
-//! close. `attach` is the exception: after `OK\n` the connection becomes a raw
+//! close. `spawn` carries the client's working directory as `cwd:` plus a
+//! percent-encoded absolute path, so a space or a newline stays on that one
+//! line. `attach` is the exception: after `OK\n` the connection becomes a raw
 //! bidirectional stream (program output out, keystrokes in). Byte 0x1d
 //! (`Ctrl-]`) detaches. Byte 0x1e (`Ctrl-^`) is handled in the client: it
 //! pages `history` and never reaches the program.
@@ -55,9 +57,10 @@ daemon
   shutdown                    kill every session and stop the daemon
 
 sessions
-  spawn NAME COMMAND...       start COMMAND (via sh -c) in a new 40x120 PTY
-  list                        name, pid, status, command (tab-separated)
-  info NAME                   pid, status, size, cursor, title, history, ...
+  spawn NAME COMMAND...       start COMMAND (via sh -c) in the client's cwd,
+                              in a new 40x120 PTY
+  list                        name, pid, status, command, cwd (tab-separated)
+  info NAME                   pid, status, size, cursor, title, history, cwd, ...
   rename NAME NEW             rename a session
   kill NAME                   kill the session's whole process tree
 
@@ -88,7 +91,8 @@ terminal
 
 socket: $XUMUX_SOCK, else $XDG_RUNTIME_DIR/xumux.sock, else /tmp/xumux-$UID/xumux.sock
 names:  1-64 chars of A-Z a-z 0-9 . _ -
-cwd/env per session: xumux spawn api 'cd ~/api && PORT=8080 exec ./server'
+cwd:    the directory `spawn` was run from, or the daemon's if that cannot be read
+env:    xumux spawn api 'PORT=8080 exec ./server'
 ";
 
 const ROWS: u16 = 40;
@@ -96,6 +100,7 @@ const COLS: u16 = 120;
 const MAX_DIM: u16 = 1000;
 const MAX_REQUEST: u64 = 1 << 20;
 const MAX_NAME: usize = 64;
+const MAX_CWD: usize = 4096; // decoded cwd bytes on a spawn request
 const MAX_WAIT_MS: u64 = 600_000;
 const INPUT_QUEUE: usize = 1024; // queued writes per session
 const MAX_PENDING: usize = 4 << 20; // queued input bytes per session before `send` reports "full"
@@ -123,6 +128,10 @@ struct Session {
     seq: u64, // creation order, for pruning
     pid: u32,
     cmd: String,
+    /// Directory the program was started in. Absolute, valid UTF-8.
+    cwd: String,
+    /// `client` when the spawn request carried a cwd, `daemon` when it did not.
+    cwd_source: &'static str,
     child: Mutex<Child>,
     /// Program input. A dedicated writer thread drains it, so neither the
     /// output reader nor a client ever blocks on a program that isn't reading.
@@ -320,7 +329,13 @@ fn client(args: &[String]) {
     }
     let mut stream = connect();
     // Literal newlines would end the request line early; send them as escapes.
-    let line = args.join(" ").replace('\r', "\\r").replace('\n', "\\n");
+    // `spawn` builds its own line so the cwd token can carry a real newline
+    // as `%0A` instead of the two characters `\` and `n`.
+    let line = if args[0] == "spawn" {
+        spawn_line(&args)
+    } else {
+        args.join(" ").replace('\r', "\\r").replace('\n', "\\n")
+    };
     stream
         .write_all(format!("{line}\n").as_bytes())
         .unwrap_or_else(|e| die(e));
@@ -332,10 +347,72 @@ fn client(args: &[String]) {
     }
 }
 
+/// `spawn` request. The cwd is one token, `cwd:` plus percent-encoding, so a
+/// space or a newline in the path cannot split the line. `cwd:-` means this
+/// process could not read its directory; the daemon uses its own.
+fn spawn_line(args: &[String]) -> String {
+    if args.len() < 3 {
+        return args.join(" ");
+    }
+    let name = &args[1];
+    let command = args[2..]
+        .join(" ")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n");
+    let token = match client_cwd() {
+        Some(cwd) => format!("cwd:{}", percent_encode(&cwd)),
+        None => "cwd:-".to_string(),
+    };
+    format!("spawn {name} {token} {command}")
+}
+
+/// Absolute UTF-8 working directory, or `None` when it cannot be read (it was
+/// removed, for example). A directory that is not UTF-8, or a path longer
+/// than 4096 bytes, is refused rather than sent.
+fn client_cwd() -> Option<String> {
+    let dir = match env::current_dir() {
+        Ok(dir) => dir,
+        Err(_) => return None,
+    };
+    let Some(cwd) = dir.to_str() else {
+        die("cwd is not valid UTF-8");
+    };
+    if cwd.len() > MAX_CWD {
+        die("cwd longer than 4096 bytes");
+    }
+    if !dir.is_absolute() {
+        die("cwd must be an absolute path");
+    }
+    Some(cwd.to_string())
+}
+
+fn session_field(name: &str, key: &str) -> String {
+    let mut stream = connect();
+    stream
+        .write_all(format!("info {name}\n").as_bytes())
+        .unwrap_or_else(|e| die(e));
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).unwrap_or_else(|e| die(e));
+    let body = match reply.strip_prefix("OK\n") {
+        Some(body) => body,
+        None => die(reply.strip_prefix("ERR ").unwrap_or(&reply).trim_end()),
+    };
+    body.lines()
+        .find_map(|l| l.strip_prefix(&format!("{key}\t")).map(str::to_string))
+        .unwrap_or_else(|| die(format!("info {name}: no {key}")))
+}
+
+fn attach_banner(name: &str, cwd: &str) -> String {
+    // Drop controls and bidi marks: this line is written to the terminal.
+    let cwd: String = cwd.chars().filter(|&c| width(c) > 0).collect();
+    format!("[xumux: attached to {name} in {cwd}; Ctrl-] detaches, Ctrl-^ views history]")
+}
+
 fn attach(args: &[String]) {
     let [_, name] = args else {
         die("usage: attach NAME")
     };
+    let cwd = session_field(name, "cwd");
     let mut stream = connect();
     let (rows, cols) = sys::term_size(&io::stdout()).unwrap_or((0, 0));
     stream
@@ -350,10 +427,7 @@ fn attach(args: &[String]) {
     if status != "OK" {
         die(status.strip_prefix("ERR ").unwrap_or(&status));
     }
-    let _ = write!(
-        io::stderr(),
-        "[xumux: attached to {name}; Ctrl-] detaches, Ctrl-^ views history]\r\n"
-    );
+    let _ = write!(io::stderr(), "{}\r\n", attach_banner(name, &cwd));
     // A pipe has no size: the session stays at the daemon default, and so does
     // the mirror we keep in order to repaint when view mode ends.
     let (term_rows, term_cols) = if rows == 0 {
@@ -1255,12 +1329,13 @@ fn dispatch(line: &str, sessions: &Sessions) -> Result<String, String> {
     let (cmd, rest) = split1(line);
     match cmd {
         "spawn" => {
-            let (name, command) = split1(rest);
-            if name.is_empty() || command.trim().is_empty() {
+            let (name, rest) = split1(rest);
+            if name.is_empty() || rest.trim().is_empty() {
                 return Err("usage: spawn NAME COMMAND...".into());
             }
             valid_name(name)?;
-            spawn(name, command, sessions)
+            let (cwd, source, command) = parse_spawn_cwd(rest)?;
+            spawn(name, command, &cwd, source, sessions)
         }
         "send" => {
             let (name, text) = split1(rest);
@@ -1372,7 +1447,7 @@ fn dispatch(line: &str, sessions: &Sessions) -> Result<String, String> {
             let mut out = String::new();
             for n in names {
                 let s = &map[n];
-                out += &format!("{n}\t{}\t{}\t{}\n", s.pid, status(s), s.cmd);
+                out += &format!("{n}\t{}\t{}\t{}\t{}\n", s.pid, status(s), s.cmd, s.cwd);
             }
             Ok(out)
         }
@@ -1387,7 +1462,7 @@ fn dispatch(line: &str, sessions: &Sessions) -> Result<String, String> {
             let fg =
                 foreground_job(s.pid).map_or("-".into(), |(pid, comm)| format!("{comm} ({pid})"));
             Ok(format!(
-                "pid\t{}\nstatus\t{}\nforeground\t{fg}\nsize\t{}x{}\ncursor\t{},{}\nalt_screen\t{}\ntitle\t{}\nhistory\t{}\nattached\t{}\nlog\t{log}\ncommand\t{}\n",
+                "pid\t{}\nstatus\t{}\nforeground\t{fg}\nsize\t{}x{}\ncursor\t{},{}\nalt_screen\t{}\ntitle\t{}\nhistory\t{}\nattached\t{}\nlog\t{log}\ncommand\t{}\ncwd\t{}\ncwd_source\t{}\n",
                 s.pid,
                 status(&s),
                 t.rows,
@@ -1399,6 +1474,8 @@ fn dispatch(line: &str, sessions: &Sessions) -> Result<String, String> {
                 t.history.len(),
                 o.watchers.len(),
                 s.cmd,
+                s.cwd,
+                s.cwd_source,
             ))
         }
         "log" => {
@@ -1548,8 +1625,9 @@ fn serve_attach(
     Ok(())
 }
 
-/// Runs in the new child, whose stdio is already the PTY: start a session,
-/// take the PTY as controlling terminal, become `sh -c 'exec COMMAND'`.
+/// Runs in the new child, whose stdio is already the PTY and whose working
+/// directory was set by `Command::current_dir`: start a session, take the PTY
+/// as controlling terminal, become `sh -c 'exec COMMAND'`.
 fn pty_exec(args: &[String]) -> ! {
     let [_, command] = args else {
         die("internal command")
@@ -1577,10 +1655,115 @@ fn open_pty_dev(path: &str, flags: i32) -> io::Result<File> {
         .open(path)
 }
 
-fn spawn(name: &str, command: &str, sessions: &Sessions) -> Result<String, String> {
+/// Bytes other than these are `%HH` in a spawn cwd token. `/` stays so a path
+/// is still readable on the wire; space, newline and `%` do not.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/') {
+            out.push(b as char);
+        } else {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0xf) as usize] as char);
+        }
+    }
+    out
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_cwd(enc: &str) -> Result<String, String> {
+    let bytes = enc.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len().min(MAX_CWD));
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return Err("bad cwd encoding".into());
+            }
+            let h = hex_val(bytes[i + 1]).ok_or("bad cwd encoding")?;
+            let l = hex_val(bytes[i + 2]).ok_or("bad cwd encoding")?;
+            out.push((h << 4) | l);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+        if out.len() > MAX_CWD {
+            return Err("cwd longer than 4096 bytes".into());
+        }
+    }
+    if out.contains(&0) {
+        return Err("cwd contains a NUL byte".into());
+    }
+    let cwd = String::from_utf8(out).map_err(|_| "cwd is not valid UTF-8".to_string())?;
+    if !cwd.starts_with('/') {
+        return Err("cwd must be an absolute path".into());
+    }
+    Ok(cwd)
+}
+
+fn daemon_cwd() -> Result<String, String> {
+    let dir =
+        env::current_dir().map_err(|e| format!("cannot read daemon working directory: {e}"))?;
+    let Some(cwd) = dir.to_str() else {
+        return Err("daemon working directory is not valid UTF-8".into());
+    };
+    if cwd.len() > MAX_CWD {
+        return Err("daemon working directory is longer than 4096 bytes".into());
+    }
+    if !dir.is_absolute() {
+        return Err("cwd must be an absolute path".into());
+    }
+    Ok(cwd.to_string())
+}
+
+/// `cwd:<percent-encoded>` is the client's directory. `cwd:-` (or no token,
+/// which is what a raw request from before this field looks like) means the
+/// client could not read one, and the daemon's directory is used instead.
+fn parse_spawn_cwd(rest: &str) -> Result<(String, &'static str, &str), String> {
+    let (word, after) = split1(rest);
+    if let Some(enc) = word.strip_prefix("cwd:") {
+        if after.trim().is_empty() {
+            return Err("usage: spawn NAME COMMAND...".into());
+        }
+        if enc == "-" {
+            return Ok((daemon_cwd()?, "daemon", after));
+        }
+        return Ok((decode_cwd(enc)?, "client", after));
+    }
+    Ok((daemon_cwd()?, "daemon", rest))
+}
+
+fn ensure_cwd(cwd: &str) -> Result<(), String> {
+    match fs::metadata(cwd) {
+        Ok(m) if m.is_dir() => Ok(()),
+        Ok(_) => Err(format!("cwd {cwd} is not a directory")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(format!("cwd {cwd} does not exist")),
+        Err(e) => Err(format!("cwd {cwd}: {e}")),
+    }
+}
+
+fn spawn(
+    name: &str,
+    command: &str,
+    cwd: &str,
+    cwd_source: &'static str,
+    sessions: &Sessions,
+) -> Result<String, String> {
     if lock(sessions).contains_key(name) {
         return Err(format!("session '{name}' already exists"));
     }
+    ensure_cwd(cwd)?;
     // O_NONBLOCK: both I/O threads wait in poll(); a blocking write to a PTY
     // whose program is gone is never woken by Linux.
     let master = open_pty_dev("/dev/ptmx", sys::O_NONBLOCK).map_err(err)?;
@@ -1591,18 +1774,23 @@ fn spawn(name: &str, command: &str, sessions: &Sessions) -> Result<String, Strin
 
     // No pre_exec hook, so std can use posix_spawn (CLONE_VM) instead of
     // fork(): fork has to copy the daemon's memory map, which grows with every
-    // session. The helper takes the terminal, then execs the shell.
+    // session. `current_dir` is a posix_spawn file action, not a pre_exec hook.
+    // The helper takes the terminal, then execs the shell, and keeps this cwd.
     let mut cmd = Command::new("/proc/self/exe");
     cmd.arg(PTY_EXEC)
         .arg(command)
         .env("TERM", "xterm-256color")
+        .current_dir(cwd)
         .stdin(Stdio::from(slave.try_clone().map_err(err)?))
         .stdout(Stdio::from(slave.try_clone().map_err(err)?))
         .stderr(Stdio::from(slave));
-    if let Ok(home) = env::var("HOME") {
-        cmd.current_dir(home);
-    }
-    let mut child = cmd.spawn().map_err(err)?;
+    let mut child = cmd.spawn().map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            format!("cwd {cwd} does not exist")
+        } else {
+            err(e)
+        }
+    })?;
     drop(cmd); // close our copies of the slave so reads hit EOF/EIO when the child exits
 
     // The writer must be able to notice `closed` and give up.
@@ -1705,6 +1893,8 @@ fn spawn(name: &str, command: &str, sessions: &Sessions) -> Result<String, Strin
             seq: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             pid,
             cmd: command.to_string(),
+            cwd: cwd.to_string(),
+            cwd_source,
             child: Mutex::new(child),
             input,
             master,
@@ -3221,5 +3411,57 @@ mod tests {
             let _ = t.contents();
             assert!(t.row < t.rows && t.col < t.cols, "round {round}");
         }
+    }
+
+    #[test]
+    fn cwd_percent_encoding_round_trips_and_rejects() {
+        let path = "/tmp/a b/\n/目录%";
+        let enc = percent_encode(path);
+        assert!(!enc.contains(' ') && !enc.contains('\n'), "{enc}");
+        assert!(enc.contains("%20") && enc.contains("%0A") && enc.contains("%25"));
+        assert_eq!(decode_cwd(&enc).unwrap(), path);
+        assert!(decode_cwd("%FF").unwrap_err().contains("UTF-8"));
+        assert!(decode_cwd("%C3%28").unwrap_err().contains("UTF-8"));
+        assert!(decode_cwd("%ZZ").unwrap_err().contains("encoding"));
+        assert!(decode_cwd("%2").unwrap_err().contains("encoding"));
+        assert!(decode_cwd("%00").unwrap_err().contains("NUL"));
+        assert!(decode_cwd("rel").unwrap_err().contains("absolute"));
+        assert!(decode_cwd("").unwrap_err().contains("absolute"));
+        let long = format!("/{}", "a".repeat(4096));
+        assert!(decode_cwd(&long).unwrap_err().contains("4096"));
+        let ok = format!("/{}", "a".repeat(4095));
+        assert_eq!(decode_cwd(&ok).unwrap(), ok);
+    }
+
+    #[test]
+    fn parse_spawn_cwd_token_default_and_daemon_sentinel() {
+        let (cwd, source, cmd) = parse_spawn_cwd("cwd:%2Ftmp%2Fa%20b echo  hi").unwrap();
+        assert_eq!(cwd, "/tmp/a b");
+        assert_eq!(source, "client");
+        assert_eq!(cmd, "echo  hi");
+        let (cwd, source, cmd) = parse_spawn_cwd("cwd:- pwd").unwrap();
+        assert_eq!(source, "daemon");
+        assert_eq!(cmd, "pwd");
+        let here = env::current_dir().unwrap();
+        assert_eq!(cwd, here.to_str().unwrap());
+        let (cwd, source, cmd) = parse_spawn_cwd("pwd -P").unwrap();
+        assert_eq!(source, "daemon");
+        assert_eq!(cmd, "pwd -P");
+        assert_eq!(cwd, here.to_str().unwrap());
+        assert!(parse_spawn_cwd("cwd:%2Ftmp").unwrap_err().contains("usage"));
+        assert!(parse_spawn_cwd("cwd:-").unwrap_err().contains("usage"));
+    }
+
+    #[test]
+    fn attach_banner_names_the_directory() {
+        assert_eq!(
+            attach_banner("sh", "/tmp/my dir"),
+            "[xumux: attached to sh in /tmp/my dir; Ctrl-] detaches, Ctrl-^ views history]"
+        );
+        // A newline or an escape in the path must not leave the status line.
+        assert_eq!(
+            attach_banner("sh", "/tmp/a\nb\u{1b}c"),
+            "[xumux: attached to sh in /tmp/abc; Ctrl-] detaches, Ctrl-^ views history]"
+        );
     }
 }

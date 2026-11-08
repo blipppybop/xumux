@@ -21,6 +21,8 @@ xumux run sh 30000 'cd ~/project && ls'
 Token tip: a short prompt keeps every `run` result small:
 `xumux spawn sh "env PS1='$ ' bash --norc"`.
 
+The program starts in the directory you ran `spawn` from. `xumux info sh` prints it as `cwd`.
+
 `run NAME MS TEXT` types `TEXT`, presses Enter, and waits until the command is **done**: the shell is back at its prompt (no foreground job running) and output has been quiet for 300 ms. Then it prints **only the new output** plus a status line:
 
 ```
@@ -98,7 +100,7 @@ xumux kill api                             # kills the program and everything it
 
 | Command | Output on success |
 |---|---|
-| `spawn NAME COMMAND...` | the pid. `COMMAND` runs through `sh -c`, cwd `$HOME`, size 40×120 |
+| `spawn NAME COMMAND...` | the pid. `COMMAND` runs through `sh -c` in the client's working directory, size 40×120. If that directory cannot be read, the daemon's directory is used and `cwd_source` is `daemon` (otherwise `client`) |
 | `run NAME MS TEXT` | new output, then `[xumux] quiet\|timeout\|exited(N)` |
 | `settle NAME [MS] [IDLE_MS]` | same status as `run`, without typing anything (defaults: 10000 ms, idle 300 ms) |
 | `wait NAME MS TEXT [\|\| TEXT...]` | the text that appeared. Error on timeout, or if the program exits first |
@@ -107,8 +109,8 @@ xumux kill api                             # kills the program and everything it
 | `keys NAME KEY...` | nothing. `Enter Tab Esc BSpace Space Up Down Left Right Home End PgUp PgDn Delete F1`–`F12 C-a`…`C-z M-x`; any other word is typed as text |
 | `screen NAME` | the visible screen, trailing blanks trimmed |
 | `history NAME [LINES]` | scrollback + screen, or just the last `LINES` lines |
-| `list` | one line per session: `name<TAB>pid<TAB>status<TAB>command` |
-| `info NAME` | `key<TAB>value` lines: pid, status, foreground (the command running in the shell, or `-`), size, cursor, alt_screen, title, history, attached, log, command |
+| `list` | one line per session: `name<TAB>pid<TAB>status<TAB>command<TAB>cwd`. The cwd is a new column after the command; the first four fields are unchanged |
+| `info NAME` | `key<TAB>value` lines: pid, status, foreground (the command running in the shell, or `-`), size, cursor, alt_screen, title, history, attached, log, command, cwd, cwd_source |
 | `stats NAME` | `procs<TAB>N`, `cpu<TAB>X%`, `rss<TAB>Y MiB` (500 ms sample) |
 | `log NAME PATH\|off` | nothing. Appends raw output (with colors) to a file |
 | `resize NAME ROWS COLS` | nothing |
@@ -140,10 +142,13 @@ Status values: `running`, `exited(N)`, `killed(sig N)`. Names are 1–64 charact
 | `input queue full ...` | the program isn't reading input (busy or hung); try `keys NAME C-c` |
 | `busy: too many clients` | more than 512 connections open at once; retry after a moment |
 | `internal error ...` | a bug in xumux; the session survives, the daemon keeps running |
+| `cwd DIR does not exist` | that directory was not there when the session was spawned |
+| `cwd is not valid UTF-8` | the working directory path is not UTF-8 |
+| `cwd longer than 4096 bytes` | the working directory path is longer than 4096 bytes |
 
 ## 6. A person attaching
 
-`xumux attach NAME` is for someone at a keyboard, not for a tool call.
+`xumux attach NAME` is for someone at a keyboard, not for a tool call. It prints `[xumux: attached to NAME in CWD; Ctrl-] detaches, Ctrl-^ views history]` and then the session.
 
 | Key | Does |
 |---|---|

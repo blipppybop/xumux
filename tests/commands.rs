@@ -66,7 +66,15 @@ fn spawn_list_info() {
     assert_eq!(rows[0][1], pid.to_string());
     assert_eq!(rows[0][2], "running");
     assert!(rows[0][3].contains("bash"));
+    // No cwd token on a raw request: the daemon's directory, still after command.
+    let here = std::env::current_dir().unwrap();
+    let here = here.to_str().unwrap();
+    assert_eq!(rows[0].len(), 5, "{list}");
+    assert_eq!(rows[0][4], here);
+    assert_eq!(rows[1][4], here);
     assert_eq!(d.info("one", "pid"), pid.to_string());
+    assert_eq!(d.info("one", "cwd"), here);
+    assert_eq!(d.info("one", "cwd_source"), "daemon");
     assert_eq!(d.info("one", "size"), "40x120");
     assert_eq!(d.info("one", "alt_screen"), "no");
     assert_eq!(d.info("one", "attached"), "0");
@@ -139,10 +147,135 @@ fn spawn_working_dir_and_environment() {
         s.contains("foo=bar") && s.contains("term=xterm-256color"),
         "{s}"
     );
-    // default cwd is $HOME
+    // A raw request with no cwd token starts in the daemon's directory.
     d.ok("spawn home pwd");
-    d.wait("home", "/");
-    assert_eq!(d.screen("home").trim(), std::env::var("HOME").unwrap());
+    let daemon_cwd = std::env::current_dir().unwrap();
+    let daemon_cwd = daemon_cwd.to_str().unwrap();
+    d.wait("home", daemon_cwd);
+    assert_eq!(d.screen("home").trim(), daemon_cwd);
+    assert_eq!(d.info("home", "cwd"), daemon_cwd);
+    assert_eq!(d.info("home", "cwd_source"), "daemon");
+}
+
+fn encode_cwd(path: &str) -> String {
+    let mut out = String::new();
+    for &b in path.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+#[test]
+fn spawn_records_client_cwd_in_list_info_banner_and_child() {
+    let d = Daemon::start();
+    let dir = d.dir.join("my dir");
+    fs::create_dir(&dir).unwrap();
+    let out = Command::new(BIN)
+        .args(["spawn", "s", "pwd", "-P"])
+        .current_dir(&dir)
+        .env("XUMUX_SOCK", &d.sock)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cwd = fs::canonicalize(&dir).unwrap();
+    let cwd = cwd.to_str().expect("temp dir is utf-8").to_string();
+    assert!(cwd.contains(' '), "{cwd}");
+    d.wait("s", &cwd);
+    let list = d.ok("list");
+    let row: Vec<&str> = list.lines().next().unwrap().split('\t').collect();
+    assert_eq!(row.len(), 5, "{row:?}");
+    assert_eq!(row[0], "s");
+    assert_eq!(row[3], "pwd -P", "command stays the fourth column");
+    assert_eq!(row[4], cwd);
+    assert_eq!(d.info("s", "cwd"), cwd);
+    assert_eq!(d.info("s", "cwd_source"), "client");
+    assert_eq!(d.screen("s").trim(), cwd);
+    // history and screen stay terminal text; cwd is not a metadata row there.
+    assert!(!d.ok("history s").lines().any(|l| l.starts_with("cwd\t")));
+
+    let mut c = attach(&d, "s");
+    c.stdin.as_mut().unwrap().write_all(&[0x1d]).unwrap();
+    let out = c.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(&format!(
+            "[xumux: attached to s in {cwd}; Ctrl-] detaches, Ctrl-^ views history]"
+        )),
+        "{err}"
+    );
+}
+
+#[test]
+fn spawn_refuses_a_missing_cwd() {
+    let d = Daemon::start();
+    let missing = d.dir.join("no such");
+    let msg = d.err(&format!(
+        "spawn s cwd:{} true",
+        encode_cwd(&missing.display().to_string())
+    ));
+    assert_eq!(msg, format!("cwd {} does not exist", missing.display()));
+    // A newline in the path stays inside the one request line.
+    let nl = format!("{}/a\nb", d.dir.display());
+    let msg = d.err(&format!("spawn s cwd:{} true", encode_cwd(&nl)));
+    assert_eq!(msg, format!("cwd {nl} does not exist"));
+    assert_eq!(d.ok("list"), "");
+}
+
+#[test]
+fn unreadable_client_cwd_uses_the_daemon_directory() {
+    let d = Daemon::start();
+    let gone = d.dir.join("gone");
+    fs::create_dir(&gone).unwrap();
+    let daemon_cwd = std::env::current_dir().unwrap();
+    let daemon_cwd = daemon_cwd.to_str().unwrap().to_string();
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg("cd \"$1\" && rmdir \"$1\" && exec \"$2\" spawn s pwd")
+        .arg("sh")
+        .arg(&gone)
+        .arg(BIN)
+        .env("XUMUX_SOCK", &d.sock)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "status {:?} stderr {} stdout {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(d.info("s", "cwd_source"), "daemon");
+    assert_eq!(d.info("s", "cwd"), daemon_cwd);
+    d.wait("s", &daemon_cwd);
+    assert_eq!(d.screen("s").trim(), daemon_cwd);
+}
+
+#[test]
+fn client_refuses_a_non_utf8_cwd() {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let d = Daemon::start();
+    let mut bytes = d.dir.as_os_str().as_bytes().to_vec();
+    bytes.extend_from_slice(b"/bad\xff");
+    let path = std::ffi::OsString::from_vec(bytes);
+    fs::create_dir(&path).unwrap();
+    let out = Command::new(BIN)
+        .args(["spawn", "s", "true"])
+        .current_dir(&path)
+        .env("XUMUX_SOCK", &d.sock)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("cwd is not valid UTF-8"), "{err}");
+    assert_eq!(d.ok("list"), "");
 }
 
 #[test]
